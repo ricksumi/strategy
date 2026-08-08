@@ -216,6 +216,8 @@ class BnStraHighRisk1:
         self.rules: dict[str, SymbolRules] = {}
         self.states = {symbol: PositionState(symbol=symbol) for symbol in config.symbols}
         self.tz = ZoneInfo("Asia/Shanghai")
+        self.state_path = Path(os.environ.get("BN_STRA_STATE_FILE", ".bn-stra-high-risk-1-state.json"))
+        self.load_runtime_state()
 
     def run_forever(self) -> None:
         self.config.validate()
@@ -426,6 +428,7 @@ class BnStraHighRisk1:
             logging.info("%s stop order not confirmed yet; counting stop_loss conservatively", state.symbol)
         if stop_filled:
             state.daily_stop_count += 1
+            self.save_runtime_state()
             logging.info("%s stop count today=%s", state.symbol, state.daily_stop_count)
         self.cancel_open_orders(state.symbol)
         self.cancel_algo_open_orders(state.symbol)
@@ -717,6 +720,43 @@ class BnStraHighRisk1:
         if state.daily_stop_day != today:
             state.daily_stop_day = today
             state.daily_stop_count = 0
+            self.save_runtime_state()
+
+    def load_runtime_state(self) -> None:
+        today = datetime.now(self.tz).strftime("%Y-%m-%d")
+        for state in self.states.values():
+            state.daily_stop_day = today
+        if not self.state_path.exists():
+            return
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            if data.get("day") != today:
+                return
+            counts = data.get("daily_stop_counts", {})
+            if not isinstance(counts, dict):
+                raise ValueError("daily_stop_counts must be an object")
+            for symbol, state in self.states.items():
+                state.daily_stop_count = max(0, int(counts.get(symbol, 0)))
+            logging.info("Restored daily stop counts for %s: %s", today, counts)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            logging.warning("Could not load runtime state from %s: %s", self.state_path, exc)
+
+    def save_runtime_state(self) -> None:
+        today = datetime.now(self.tz).strftime("%Y-%m-%d")
+        data = {
+            "day": today,
+            "daily_stop_counts": {
+                symbol: state.daily_stop_count
+                for symbol, state in self.states.items()
+                if state.daily_stop_day == today and state.daily_stop_count > 0
+            },
+        }
+        temp_path = self.state_path.with_name(f"{self.state_path.name}.tmp")
+        try:
+            temp_path.write_text(json.dumps(data, sort_keys=True) + "\n", encoding="utf-8")
+            temp_path.replace(self.state_path)
+        except OSError as exc:
+            logging.error("Could not save runtime state to %s: %s", self.state_path, exc)
 
 
 def strategy_signal(

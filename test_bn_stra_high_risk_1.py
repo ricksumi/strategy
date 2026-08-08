@@ -195,19 +195,22 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         self.assertEqual(client.calls[-1], ("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": "ETHUSDT"}))
 
     def test_stop_loss_count_uses_conservative_fallback(self):
-        client = RecordingClient(algo_order_response={"algoStatus": "NEW"})
-        bot = BnStraHighRisk1(test_config(False), client)
-        state = PositionState(
-            symbol="ETHUSDT",
-            side="long",
-            entry_price=Decimal("100"),
-            quantity=Decimal("1"),
-            stop_price=Decimal("98"),
-            stop_client_id="cid",
-            stop_reason="stop_loss",
-        )
+        with TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            client = RecordingClient(algo_order_response={"algoStatus": "NEW"})
+            with patch.dict("os.environ", {"BN_STRA_STATE_FILE": str(state_file)}):
+                bot = BnStraHighRisk1(test_config(False), client)
+                state = PositionState(
+                    symbol="ETHUSDT",
+                    side="long",
+                    entry_price=Decimal("100"),
+                    quantity=Decimal("1"),
+                    stop_price=Decimal("98"),
+                    stop_client_id="cid",
+                    stop_reason="stop_loss",
+                )
 
-        bot.on_position_closed(state)
+                bot.on_position_closed(state)
 
         self.assertEqual(state.daily_stop_count, 1)
 
@@ -234,6 +237,30 @@ class BnStraHighRisk1Tests(unittest.TestCase):
                 load_env_file(env_file)
 
                 self.assertEqual(os.environ["BINANCE_API_KEY"], "shell-key")
+
+    def test_daily_stop_counts_survive_restart(self):
+        with TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            with patch.dict("os.environ", {"BN_STRA_STATE_FILE": str(state_file)}):
+                first = BnStraHighRisk1(test_config(False), FakeClient([]))
+                first.states["ETHUSDT"].daily_stop_count = 2
+                first.save_runtime_state()
+
+                restarted = BnStraHighRisk1(test_config(False), FakeClient([]))
+
+            self.assertEqual(restarted.states["ETHUSDT"].daily_stop_count, 2)
+
+    def test_stale_daily_stop_counts_are_ignored(self):
+        with TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            state_file.write_text(
+                '{"day":"2000-01-01","daily_stop_counts":{"ETHUSDT":2}}\n',
+                encoding="utf-8",
+            )
+            with patch.dict("os.environ", {"BN_STRA_STATE_FILE": str(state_file)}):
+                bot = BnStraHighRisk1(test_config(False), FakeClient([]))
+
+            self.assertEqual(bot.states["ETHUSDT"].daily_stop_count, 0)
 
 
 class FakeClient(BinanceClient):

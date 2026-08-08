@@ -1,5 +1,7 @@
 .env
 config.json
+.bn-stra-high-risk-1-state.json
+.bn-stra-high-risk-1-state.json.tmp
 __pycache__/
 *.py[cod]
 .DS_Store

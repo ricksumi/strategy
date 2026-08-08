@@ -62,11 +62,11 @@ The legacy `allocation_fraction` field is accepted for configuration compatibili
 
 ```text
 Breakeven trigger = +15% margin ROI, approximately a 3% favorable price move
-Trailing activation = +15% margin ROI
-Trailing callback = 2% of price
+Trailing activation = +50% margin ROI, approximately a 10% favorable price move
+Trailing callback = 4% of price
 ```
 
-At the trigger, the bot moves the stop beyond entry by `fee_rate * 2` and activates trailing management. With the default `fee_rate=0.0004`, the breakeven stop is approximately `entry * 1.0008` for a long and `entry * 0.9992` for a short. Actual fills may still lose money because of slippage or higher fees.
+At the breakeven trigger, the bot moves the stop beyond entry by `fee_rate * 2`. Trailing management starts only after the separate trailing activation threshold is reached. With the default `fee_rate=0.0004`, the breakeven stop is approximately `entry * 1.0008` for a long and `entry * 0.9992` for a short. Actual fills may still lose money because of slippage or higher fees.
 
 ## Risk controls
 
@@ -95,7 +95,7 @@ Create a local runtime configuration:
 cp config.example.json config.json
 ```
 
-`config.json` and `.env` are ignored by Git and must never be committed.
+`config.json`, `.env`, and the runtime state file are ignored by Git and must never be committed.
 
 Run one dry-run scan:
 
@@ -184,4 +184,5 @@ test_bn_stra_high_risk_1.py    Unit tests
 - Protective stops are submitted through the Binance Algo Order API.
 - Trailing behavior is implemented by canceling and replacing conditional stop orders.
 - Restarting while positions are open can lose in-memory stop-management state. Prefer restarting only when the account is flat.
+- Daily initial-stop counts are persisted in `.bn-stra-high-risk-1-state.json` and restored after a restart.
 - Always verify the protective stop after a live entry.
