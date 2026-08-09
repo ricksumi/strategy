@@ -50,6 +50,11 @@ class BotConfig:
     atr_period: int
     atr_min_pct: Decimal
     atr_max_pct: Decimal
+    atr_full_size_max_pct: Decimal
+    atr_reduced_size_max_pct: Decimal
+    atr_reduced_size_factor: Decimal
+    atr_high_size_factor: Decimal
+    stop_update_min_pct: Decimal
     daily_stop_limit: int
     cooldown_seconds: int
     poll_seconds: int
@@ -85,6 +90,11 @@ class BotConfig:
             atr_period=int(raw.get("atr_period", 14)),
             atr_min_pct=Decimal(str(raw.get("atr_min_pct", "0"))),
             atr_max_pct=Decimal(str(raw.get("atr_max_pct", "0"))),
+            atr_full_size_max_pct=Decimal(str(raw.get("atr_full_size_max_pct", "0.03"))),
+            atr_reduced_size_max_pct=Decimal(str(raw.get("atr_reduced_size_max_pct", "0.04"))),
+            atr_reduced_size_factor=Decimal(str(raw.get("atr_reduced_size_factor", "0.70"))),
+            atr_high_size_factor=Decimal(str(raw.get("atr_high_size_factor", "0.40"))),
+            stop_update_min_pct=Decimal(str(raw.get("stop_update_min_pct", "0.002"))),
             daily_stop_limit=int(raw.get("daily_stop_limit", 3)),
             cooldown_seconds=int(raw.get("cooldown_seconds", 600)),
             poll_seconds=int(raw.get("poll_seconds", 15)),
@@ -123,6 +133,12 @@ class BotConfig:
             raise ValueError("atr_min_pct and atr_max_pct cannot be negative")
         if self.atr_max_pct and self.atr_min_pct > self.atr_max_pct:
             raise ValueError("atr_min_pct cannot be greater than atr_max_pct")
+        if not (self.atr_full_size_max_pct <= self.atr_reduced_size_max_pct <= self.atr_max_pct):
+            raise ValueError("ATR sizing thresholds must be ordered and no greater than atr_max_pct")
+        if not (0 < self.atr_reduced_size_factor <= 1 and 0 < self.atr_high_size_factor <= 1):
+            raise ValueError("ATR size factors must be in (0, 1]")
+        if self.stop_update_min_pct < 0:
+            raise ValueError("stop_update_min_pct cannot be negative")
         if self.working_type not in {"MARK_PRICE", "CONTRACT_PRICE"}:
             raise ValueError("working_type must be MARK_PRICE or CONTRACT_PRICE")
         if self.position_side != "BOTH":
@@ -215,6 +231,7 @@ class BnStraHighRisk1:
         self.client = client
         self.rules: dict[str, SymbolRules] = {}
         self.states = {symbol: PositionState(symbol=symbol) for symbol in config.symbols}
+        self.managed_symbols = list(config.symbols)
         self.tz = ZoneInfo("Asia/Shanghai")
         self.state_path = Path(os.environ.get("BN_STRA_STATE_FILE", ".bn-stra-high-risk-1-state.json"))
         self.load_runtime_state()
@@ -222,12 +239,13 @@ class BnStraHighRisk1:
     def run_forever(self) -> None:
         self.config.validate()
         self.ensure_one_way_mode()
+        self.discover_existing_positions()
         self.rules = self.load_symbol_rules()
         self.set_leverage_for_all()
         logging.info("Starting %s for symbols=%s dry_run=%s", STRATEGY_NAME, self.config.symbols, self.config.dry_run)
         while True:
             started = time.time()
-            for symbol in self.config.symbols:
+            for symbol in self.managed_symbols:
                 try:
                     self.tick_symbol(symbol)
                 except Exception:
@@ -238,10 +256,11 @@ class BnStraHighRisk1:
     def run_once(self) -> None:
         self.config.validate()
         self.ensure_one_way_mode()
+        self.discover_existing_positions()
         self.rules = self.load_symbol_rules()
         self.set_leverage_for_all()
         logging.info("Running one %s scan for symbols=%s dry_run=%s", STRATEGY_NAME, self.config.symbols, self.config.dry_run)
-        for symbol in self.config.symbols:
+        for symbol in self.managed_symbols:
             self.tick_symbol(symbol)
 
     def tick_symbol(self, symbol: str) -> None:
@@ -257,6 +276,9 @@ class BnStraHighRisk1:
 
         if state.quantity != 0:
             self.on_position_closed(state)
+
+        if symbol not in self.config.symbols:
+            return
 
         if state.daily_stop_count >= self.config.daily_stop_limit:
             logging.info("%s daily stop limit reached: %s", symbol, state.daily_stop_count)
@@ -280,11 +302,19 @@ class BnStraHighRisk1:
             return
         if not self.pullback_entry_ready(state, signal, candles[-1].close):
             return
-        self.open_position(symbol, signal)
+        atr_pct = atr_percent(candles, self.config.atr_period)
+        size_factor = atr_size_factor(
+            atr_pct,
+            self.config.atr_full_size_max_pct,
+            self.config.atr_reduced_size_max_pct,
+            self.config.atr_reduced_size_factor,
+            self.config.atr_high_size_factor,
+        )
+        self.open_position(symbol, signal, size_factor)
 
-    def open_position(self, symbol: str, side: str) -> None:
+    def open_position(self, symbol: str, side: str, size_factor: Decimal = Decimal("1")) -> None:
         equity = self.get_total_usdt_equity()
-        margin = self.margin_per_symbol(equity)
+        margin = self.margin_per_symbol(equity) * size_factor
         mark_price = self.get_mark_price(symbol)
         qty = round_to_step((margin * Decimal(self.config.leverage)) / mark_price, self.rules[symbol].step_size)
         if qty < self.rules[symbol].min_qty:
@@ -292,7 +322,7 @@ class BnStraHighRisk1:
             return
 
         order_side = "BUY" if side == "long" else "SELL"
-        logging.info("%s opening %s qty=%s margin=%s mark=%s", symbol, side, qty, margin, mark_price)
+        logging.info("%s opening %s qty=%s margin=%s size_factor=%s mark=%s", symbol, side, qty, margin, size_factor, mark_price)
         order = self.place_market_order(symbol, order_side, qty)
         entry_price = Decimal(str(order.get("avgPrice", "0"))) if order else mark_price
         if entry_price <= 0:
@@ -366,7 +396,7 @@ class BnStraHighRisk1:
             move_reasons.append("trailing")
 
         new_stop = round_stop_price(new_stop, self.rules[state.symbol].tick_size, state.side)
-        if stop_improved(new_stop, state.stop_price, state.side):
+        if stop_improved_by(new_stop, state.stop_price, state.side, self.config.stop_update_min_pct):
             if state.trailing_active:
                 state.stop_reason = "trailing_stop"
             elif state.breakeven_done:
@@ -547,7 +577,7 @@ class BnStraHighRisk1:
     def load_symbol_rules(self) -> dict[str, SymbolRules]:
         data = self.client.public_request("GET", "/fapi/v1/exchangeInfo")
         result: dict[str, SymbolRules] = {}
-        wanted = set(self.config.symbols)
+        wanted = set(self.managed_symbols)
         for item in data["symbols"]:
             if item["symbol"] not in wanted:
                 continue
@@ -573,6 +603,22 @@ class BnStraHighRisk1:
                 logging.info("[dry-run] set leverage %s", params)
             else:
                 self.client.signed_request("POST", "/fapi/v1/leverage", params)
+
+    def discover_existing_positions(self) -> None:
+        if self.config.dry_run:
+            return
+        positions = self.client.signed_request("GET", "/fapi/v2/positionRisk")
+        for position in positions:
+            symbol = str(position.get("symbol", "")).upper()
+            if not symbol or Decimal(position.get("positionAmt", "0")) == 0:
+                continue
+            if position.get("positionSide", "BOTH") != "BOTH":
+                continue
+            if symbol not in self.states:
+                self.states[symbol] = PositionState(symbol=symbol)
+            if symbol not in self.managed_symbols:
+                self.managed_symbols.append(symbol)
+                logging.warning("Managing existing position for non-entry symbol %s; new entries remain disabled", symbol)
 
     def ensure_one_way_mode(self) -> None:
         if self.config.dry_run:
@@ -909,6 +955,29 @@ def improve_stop(current: Decimal, candidate: Decimal, side: str) -> Decimal:
 
 def stop_improved(new: Decimal, old: Decimal, side: str) -> bool:
     return new > old if side == "long" else new < old
+
+
+def stop_improved_by(new: Decimal, old: Decimal, side: str, minimum_pct: Decimal) -> bool:
+    if not stop_improved(new, old, side):
+        return False
+    if old <= 0 or minimum_pct <= 0:
+        return True
+    improvement = (new - old) / old if side == "long" else (old - new) / old
+    return improvement >= minimum_pct
+
+
+def atr_size_factor(
+    atr_pct: Decimal | None,
+    full_size_max_pct: Decimal,
+    reduced_size_max_pct: Decimal,
+    reduced_size_factor: Decimal,
+    high_size_factor: Decimal,
+) -> Decimal:
+    if atr_pct is None or atr_pct <= full_size_max_pct:
+        return Decimal("1")
+    if atr_pct <= reduced_size_max_pct:
+        return reduced_size_factor
+    return high_size_factor
 
 
 def round_stop_price(price: Decimal, tick_size: Decimal, side: str) -> Decimal:

@@ -13,11 +13,11 @@ The current sizing rule allocates account margin across the configured symbol co
 ## Default symbols
 
 ```text
-BICOUSDT
 TUTUSDT
-GWEIUSDT
-EPICUSDT
-CAPUSDT
+BMTUSDT
+MUBARAKUSDT
+COOKIEUSDT
+IOTXUSDT
 ```
 
 ## Signal filters
@@ -27,7 +27,7 @@ K-line interval: 5m
 EMA20 > EMA60: long only
 EMA20 < EMA60: short only
 ADX14 > 30: entry allowed
-0.5% <= ATR14 / close <= 4%: entry allowed
+0.5% <= ATR14 / close <= 6%: entry allowed
 Otherwise: no entry
 ```
 
@@ -61,12 +61,14 @@ The legacy `allocation_fraction` field is accepted for configuration compatibili
 ## Exit management
 
 ```text
-Breakeven trigger = +15% margin ROI, approximately a 3% favorable price move
+Breakeven trigger = +25% margin ROI, approximately a 5% favorable price move
 Trailing activation = +50% margin ROI, approximately a 10% favorable price move
 Trailing callback = 4% of price
 ```
 
 At the breakeven trigger, the bot moves the stop beyond entry by `fee_rate * 2`. Trailing management starts only after the separate trailing activation threshold is reached. With the default `fee_rate=0.0004`, the breakeven stop is approximately `entry * 1.0008` for a long and `entry * 0.9992` for a short. Actual fills may still lose money because of slippage or higher fees.
+
+Position size is reduced as volatility rises: ATR up to 3% uses full size, 3%-4% uses 70%, and 4%-6% uses 40%. Above 6% no new position is opened. Managed trailing stops are replaced only when the stop improves by at least 0.2%.
 
 ## Risk controls
 
@@ -185,4 +187,5 @@ test_bn_stra_high_risk_1.py    Unit tests
 - Trailing behavior is implemented by canceling and replacing conditional stop orders.
 - Restarting while positions are open can lose in-memory stop-management state. Prefer restarting only when the account is flat.
 - Daily initial-stop counts are persisted in `.bn-stra-high-risk-1-state.json` and restored after a restart.
+- Existing account positions outside the configured entry symbols remain monitored until they close; the bot will not reopen them.
 - Always verify the protective stop after a live entry.

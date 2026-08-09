@@ -14,6 +14,7 @@ from bn_stra_high_risk_1 import (
     SymbolRules,
     adx_values,
     atr_percent,
+    atr_size_factor,
     breakeven_stop_price,
     ema_values,
     improve_stop,
@@ -28,6 +29,7 @@ from bn_stra_high_risk_1 import (
     profit_trigger_price,
     round_stop_price,
     strategy_signal,
+    stop_improved_by,
 )
 
 
@@ -55,6 +57,18 @@ class BnStraHighRisk1Tests(unittest.TestCase):
     def test_round_stop_price(self):
         self.assertEqual(round_stop_price(Decimal("100.129"), Decimal("0.01"), "long"), Decimal("100.12"))
         self.assertEqual(round_stop_price(Decimal("100.121"), Decimal("0.01"), "short"), Decimal("100.13"))
+
+    def test_stop_update_requires_minimum_improvement(self):
+        self.assertFalse(stop_improved_by(Decimal("100.10"), Decimal("100"), "long", Decimal("0.002")))
+        self.assertTrue(stop_improved_by(Decimal("100.20"), Decimal("100"), "long", Decimal("0.002")))
+        self.assertFalse(stop_improved_by(Decimal("99.90"), Decimal("100"), "short", Decimal("0.002")))
+        self.assertTrue(stop_improved_by(Decimal("99.80"), Decimal("100"), "short", Decimal("0.002")))
+
+    def test_atr_size_factor_uses_volatility_tiers(self):
+        args = (Decimal("0.03"), Decimal("0.04"), Decimal("0.70"), Decimal("0.40"))
+        self.assertEqual(atr_size_factor(Decimal("0.03"), *args), Decimal("1"))
+        self.assertEqual(atr_size_factor(Decimal("0.035"), *args), Decimal("0.70"))
+        self.assertEqual(atr_size_factor(Decimal("0.05"), *args), Decimal("0.40"))
 
     def test_pullback_entry_price(self):
         self.assertEqual(pullback_target_price(Decimal("100"), "long", Decimal("0.004")), Decimal("99.600"))
@@ -139,6 +153,18 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         bot = BnStraHighRisk1(config, FakeClient([]))
 
         self.assertEqual(bot.margin_per_symbol(Decimal("1500")), Decimal("500"))
+
+    def test_non_entry_managed_symbol_does_not_open_after_close(self):
+        bot = BnStraHighRisk1(test_config(False), FakeClient([]))
+        bot.states["OLDUSDT"] = PositionState(symbol="OLDUSDT")
+        bot.managed_symbols.append("OLDUSDT")
+
+        with patch.object(bot, "get_position", return_value={"positionAmt": "0"}), patch.object(
+            bot, "fetch_candles"
+        ) as fetch_candles:
+            bot.tick_symbol("OLDUSDT")
+
+        fetch_candles.assert_not_called()
 
     def test_config_accepts_5m_interval(self):
         config = test_config(False, interval="5m")
@@ -318,6 +344,11 @@ def test_config(dry_run=True, symbols=("ETHUSDT",), interval="5m"):
         atr_period=14,
         atr_min_pct=Decimal("0"),
         atr_max_pct=Decimal("0"),
+        atr_full_size_max_pct=Decimal("0"),
+        atr_reduced_size_max_pct=Decimal("0"),
+        atr_reduced_size_factor=Decimal("0.70"),
+        atr_high_size_factor=Decimal("0.40"),
+        stop_update_min_pct=Decimal("0.002"),
         daily_stop_limit=3,
         cooldown_seconds=600,
         poll_seconds=15,
