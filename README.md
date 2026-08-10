@@ -64,8 +64,8 @@ The legacy `allocation_fraction` field is accepted for configuration compatibili
 ## Exit management
 
 ```text
-Breakeven trigger = +25% margin ROI, approximately a 5% favorable price move
-Trailing activation = +50% margin ROI, approximately a 10% favorable price move
+Breakeven trigger = +12% margin ROI, approximately a 2.4% favorable price move
+Trailing activation = +25% margin ROI, approximately a 5% favorable price move
 Trailing callback = 4% of price
 ```
 
