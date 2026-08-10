@@ -9,6 +9,7 @@ import hmac
 import json
 import logging
 import os
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -18,6 +19,7 @@ from datetime import datetime
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, getcontext
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 
@@ -71,6 +73,9 @@ class BotConfig:
     dry_run: bool
     testnet: bool
     recv_window: int
+    hermes_enabled: bool = False
+    hermes_socket_path: str = ""
+    hermes_target: str = "weixin"
 
     @classmethod
     def from_file(cls, path: str) -> "BotConfig":
@@ -118,6 +123,9 @@ class BotConfig:
             dry_run=bool(raw.get("dry_run", True)),
             testnet=bool(raw.get("testnet", True)),
             recv_window=int(raw.get("recv_window", 5000)),
+            hermes_enabled=bool(raw.get("hermes_enabled", False)),
+            hermes_socket_path=str(raw.get("hermes_socket_path", "")),
+            hermes_target=str(raw.get("hermes_target", "weixin")),
         )
 
     def validate(self) -> None:
@@ -159,6 +167,8 @@ class BotConfig:
             raise ValueError("working_type must be MARK_PRICE or CONTRACT_PRICE")
         if self.position_side != "BOTH":
             raise ValueError("bn-stra-high-risk-1 currently supports one-way mode only: position_side=BOTH")
+        if self.hermes_enabled and (not self.hermes_socket_path or not self.hermes_target):
+            raise ValueError("hermes_socket_path and hermes_target are required when Hermes notifications are enabled")
 
 
 @dataclass(frozen=True)
@@ -201,6 +211,42 @@ class PositionState:
     daily_stop_day: str = ""
     daily_stop_count: int = 0
     daily_limit_logged: bool = False
+    opened_at_ms: int = 0
+    initial_margin: Decimal = Decimal("0")
+
+
+class HermesNotifier:
+    def __init__(self, enabled: bool, socket_path: str, target: str) -> None:
+        self.enabled = enabled
+        self.socket_path = socket_path
+        self.target = target
+
+    def send(self, message: str) -> None:
+        if not self.enabled:
+            return
+        request = {
+            "jsonrpc": "2.0",
+            "id": uuid4().hex,
+            "method": "submit",
+            "params": {"target": self.target, "message": message, "media_path": None},
+        }
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(2)
+                client.connect(self.socket_path)
+                client.sendall((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
+                response = b""
+                while not response.endswith(b"\n"):
+                    chunk = client.recv(65536)
+                    if not chunk:
+                        break
+                    response += chunk
+            result = json.loads(response)
+            if "error" in result:
+                raise RuntimeError(result["error"].get("message", "Hermes RPC error"))
+            logging.info("Hermes notification queued job_id=%s", result.get("result", {}).get("job_id"))
+        except Exception as exc:
+            logging.warning("Hermes notification failed: %s", exc)
 
 
 class BinanceClient:
@@ -252,6 +298,11 @@ class BnStraHighRisk1:
         self.managed_symbols = list(config.symbols)
         self.tz = ZoneInfo("Asia/Shanghai")
         self.state_path = Path(os.environ.get("BN_STRA_STATE_FILE", ".bn-stra-high-risk-1-state.json"))
+        self.notifier = HermesNotifier(
+            config.hermes_enabled and not config.dry_run,
+            config.hermes_socket_path,
+            config.hermes_target,
+        )
         self.load_runtime_state()
 
     def run_forever(self) -> None:
@@ -392,7 +443,10 @@ class BnStraHighRisk1:
         state.stop_reason = "stop_loss"
         state.breakeven_done = False
         state.trailing_active = False
+        state.opened_at_ms = int(time.time() * 1000)
+        state.initial_margin = margin
         self.clear_pending_signal(state)
+        self.save_runtime_state()
         logging.info(
             "%s opened %s entry=%s qty=%s initial_stop=%s stop_algo_id=%s stop_client_id=%s margin=%s equity=%s",
             symbol,
@@ -405,6 +459,7 @@ class BnStraHighRisk1:
             margin,
             equity,
         )
+        self.notify_position_opened(state)
 
     def margin_per_symbol(self, equity: Decimal) -> Decimal:
         return equity / Decimal(len(self.config.symbols))
@@ -486,6 +541,8 @@ class BnStraHighRisk1:
         close_stop_price = state.stop_price
         close_stop_order_id = state.stop_order_id
         close_stop_client_id = state.stop_client_id
+        close_opened_at_ms = state.opened_at_ms
+        close_margin = state.initial_margin
         logging.info(
             "%s position closed side=%s entry=%s qty=%s last_stop=%s stop_algo_id=%s stop_client_id=%s stop_reason=%s; entering cooldown",
             state.symbol,
@@ -507,6 +564,7 @@ class BnStraHighRisk1:
             logging.info("%s stop count today=%s", state.symbol, state.daily_stop_count)
         self.cancel_open_orders(state.symbol)
         self.cancel_algo_open_orders(state.symbol)
+        self.notify_position_closed(state, close_opened_at_ms, close_margin)
         state.side = None
         state.entry_price = Decimal("0")
         state.quantity = Decimal("0")
@@ -517,8 +575,81 @@ class BnStraHighRisk1:
         state.stop_reason = "stop_loss"
         state.breakeven_done = False
         state.trailing_active = False
+        state.opened_at_ms = 0
+        state.initial_margin = Decimal("0")
         state.cooldown_until = time.time() + self.config.cooldown_seconds
+        self.save_runtime_state()
         logging.info("%s cooldown_until=%s", state.symbol, datetime.fromtimestamp(state.cooldown_until, self.tz).isoformat())
+
+    def notify_position_opened(self, state: PositionState) -> None:
+        assert state.side is not None
+        breakeven_trigger = profit_trigger_price(
+            state.entry_price, state.side, self.config.breakeven_roi, self.config.leverage
+        )
+        trailing_trigger = profit_trigger_price(
+            state.entry_price, state.side, self.config.trailing_activation_roi, self.config.leverage
+        )
+        self.notifier.send(
+            "\n".join(
+                [
+                    f"[OPEN] {state.symbol} {state.side.upper()} {self.config.leverage}x",
+                    f"Entry: {format_decimal(state.entry_price)}",
+                    f"Quantity: {format_decimal(state.quantity)}",
+                    f"Margin: {state.initial_margin:.4f} USDT",
+                    f"Notional: {(state.entry_price * state.quantity):.4f} USDT",
+                    f"Initial stop: {format_decimal(state.stop_price)}",
+                    f"Breakeven trigger: {format_decimal(breakeven_trigger)} (+{self.config.breakeven_roi * 100}% ROI)",
+                    f"Trailing trigger: {format_decimal(trailing_trigger)} (+{self.config.trailing_activation_roi * 100}% ROI)",
+                ]
+            )
+        )
+
+    def notify_position_closed(self, state: PositionState, opened_at_ms: int, initial_margin: Decimal) -> None:
+        now_ms = int(time.time() * 1000)
+        realized = Decimal("0")
+        commission = Decimal("0")
+        funding = Decimal("0")
+        complete = False
+        if not self.config.dry_run and opened_at_ms > 0:
+            try:
+                rows = self.client.signed_request(
+                    "GET",
+                    "/fapi/v1/income",
+                    {"symbol": state.symbol, "startTime": max(0, opened_at_ms - 5000), "endTime": now_ms, "limit": 1000},
+                )
+                for row in rows:
+                    value = Decimal(str(row.get("income", "0")))
+                    income_type = row.get("incomeType")
+                    if income_type == "REALIZED_PNL":
+                        realized += value
+                    elif income_type == "COMMISSION":
+                        commission += value
+                    elif income_type == "FUNDING_FEE":
+                        funding += value
+                complete = True
+            except Exception as exc:
+                logging.warning("%s PnL summary query failed: %s", state.symbol, exc)
+        net = realized + commission + funding
+        roi = (net / initial_margin * Decimal("100")) if complete and initial_margin > 0 else None
+        duration = max(0, (now_ms - opened_at_ms) // 1000) if opened_at_ms else 0
+        pnl_label = f"{net:+.4f} USDT" if complete else "unavailable"
+        roi_label = f"{roi:+.2f}%" if roi is not None else "unavailable"
+        self.notifier.send(
+            "\n".join(
+                [
+                    f"[CLOSED] {state.symbol} {(state.side or 'unknown').upper()}",
+                    f"Reason: {state.stop_reason}",
+                    f"Entry: {format_decimal(state.entry_price)}",
+                    f"Quantity: {format_decimal(state.quantity)}",
+                    f"Realized PnL: {realized:+.4f} USDT" if complete else "Realized PnL: unavailable",
+                    f"Commission: {commission:+.4f} USDT" if complete else "Commission: unavailable",
+                    f"Funding: {funding:+.4f} USDT" if complete else "Funding: unavailable",
+                    f"Net PnL: {pnl_label}",
+                    f"Margin ROI: {roi_label}",
+                    f"Duration: {duration // 3600}h {(duration % 3600) // 60}m {duration % 60}s",
+                ]
+            )
+        )
 
     def pullback_entry_ready(
         self, state: PositionState, side: str, signal_price: Decimal, confirm_pct: Decimal | None = None
@@ -745,6 +876,11 @@ class BnStraHighRisk1:
             state.entry_price = entry
             state.best_price = entry
             state.stop_price = initial_stop_price(entry, side, self.config.stop_loss_roi, self.config.leverage)
+            if state.opened_at_ms <= 0:
+                state.opened_at_ms = int(time.time() * 1000)
+            if state.initial_margin <= 0:
+                state.initial_margin = entry * abs(amt) / Decimal(self.config.leverage)
+            self.save_runtime_state()
 
     def place_market_order(self, symbol: str, side: str, quantity: Decimal) -> dict[str, Any]:
         params = {
@@ -835,13 +971,20 @@ class BnStraHighRisk1:
             return
         try:
             data = json.loads(self.state_path.read_text(encoding="utf-8"))
-            if data.get("day") != today:
-                return
-            counts = data.get("daily_stop_counts", {})
+            counts = data.get("daily_stop_counts", {}) if data.get("day") == today else {}
             if not isinstance(counts, dict):
                 raise ValueError("daily_stop_counts must be an object")
             for symbol, state in self.states.items():
                 state.daily_stop_count = max(0, int(counts.get(symbol, 0)))
+            active_trades = data.get("active_trades", {})
+            if not isinstance(active_trades, dict):
+                raise ValueError("active_trades must be an object")
+            for symbol, raw_trade in active_trades.items():
+                if symbol not in self.states or not isinstance(raw_trade, dict):
+                    continue
+                state = self.states[symbol]
+                state.opened_at_ms = max(0, int(raw_trade.get("opened_at_ms", 0)))
+                state.initial_margin = max(Decimal("0"), Decimal(str(raw_trade.get("initial_margin", "0"))))
             logging.info("Restored daily stop counts for %s: %s", today, counts)
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             logging.warning("Could not load runtime state from %s: %s", self.state_path, exc)
@@ -854,6 +997,14 @@ class BnStraHighRisk1:
                 symbol: state.daily_stop_count
                 for symbol, state in self.states.items()
                 if state.daily_stop_day == today and state.daily_stop_count > 0
+            },
+            "active_trades": {
+                symbol: {
+                    "opened_at_ms": state.opened_at_ms,
+                    "initial_margin": format_decimal(state.initial_margin),
+                }
+                for symbol, state in self.states.items()
+                if state.opened_at_ms > 0
             },
         }
         temp_path = self.state_path.with_name(f"{self.state_path.name}.tmp")

@@ -314,6 +314,20 @@ class BnStraHighRisk1Tests(unittest.TestCase):
 
             self.assertEqual(bot.states["ETHUSDT"].daily_stop_count, 0)
 
+    def test_active_trade_metadata_survives_restart_and_day_change(self):
+        with TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            state_file.write_text(
+                '{"day":"2000-01-01","daily_stop_counts":{},"active_trades":'
+                '{"ETHUSDT":{"opened_at_ms":123456,"initial_margin":"250.5"}}}\n',
+                encoding="utf-8",
+            )
+            with patch.dict("os.environ", {"BN_STRA_STATE_FILE": str(state_file)}):
+                bot = BnStraHighRisk1(test_config(False), FakeClient([]))
+
+            self.assertEqual(bot.states["ETHUSDT"].opened_at_ms, 123456)
+            self.assertEqual(bot.states["ETHUSDT"].initial_margin, Decimal("250.5"))
+
 
 class FakeClient(BinanceClient):
     def __init__(self, position_response):

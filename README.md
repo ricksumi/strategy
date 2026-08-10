@@ -85,6 +85,18 @@ Stop trigger source: MARK_PRICE
 
 Breakeven and trailing-stop exits do not increment the daily initial-stop counter.
 
+## Hermes notifications
+
+The bot can enqueue open and close notifications through a local `hermes-work` Unix socket. Open notifications include position sizing and protection levels. Close notifications query Binance income history and report realized PnL, commission, funding, net PnL, margin ROI, and holding duration.
+
+```json
+"hermes_enabled": true,
+"hermes_socket_path": "/home/inkb/apps/hermes-work/hermes-work.sock",
+"hermes_target": "weixin"
+```
+
+Hermes delivery failures are logged but never interrupt order or risk-management processing. Runtime state persists each trade's opening time and initial margin so PnL summaries survive normal service restarts.
+
 ## Requirements
 
 - Python 3.11 or later is recommended.

@@ -37,6 +37,9 @@
   "kline_limit": 200,
   "working_type": "MARK_PRICE",
   "position_side": "BOTH",
+  "hermes_enabled": false,
+  "hermes_socket_path": "/home/inkb/apps/hermes-work/hermes-work.sock",
+  "hermes_target": "weixin",
   "dry_run": true,
   "testnet": false,
   "recv_window": 5000
