@@ -1482,7 +1482,10 @@ def format_decimal(value: Decimal) -> str:
 
 
 def client_order_id(symbol: str, label: str) -> str:
-    short_symbol = symbol.lower().replace("usdt", "")
+    base_symbol = symbol.lower().replace("usdt", "")
+    short_symbol = "".join(ch for ch in base_symbol if ch.isascii() and ch.isalnum())
+    if not short_symbol:
+        short_symbol = hashlib.sha1(symbol.encode("utf-8")).hexdigest()[:8]
     short_label = label[:2]
     return f"bshr1_{short_symbol}_{short_label}_{int(time.time() * 1000) % 1000000000000}"
 

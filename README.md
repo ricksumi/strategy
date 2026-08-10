@@ -14,6 +14,7 @@ The configured base margin is `200 USDT` per new position. ATR risk scaling may 
 
 ```text
 BMTUSDT
+龙虾USDT
 ACTUSDT
 CAPUSDT
 NILUSDT

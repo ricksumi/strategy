@@ -124,6 +124,9 @@ class BnStraHighRisk1Tests(unittest.TestCase):
 
     def test_client_order_id_is_short_enough(self):
         self.assertLessEqual(len(client_order_id("SNDKUSDT", "managed")), 36)
+        unicode_id = client_order_id("龙虾USDT", "initial")
+        self.assertTrue(unicode_id.isascii())
+        self.assertLessEqual(len(unicode_id), 36)
 
     def test_ema_and_adx_signal(self):
         candles = [
