@@ -423,7 +423,23 @@ class BnStraHighRisk1:
             return
         atr_pct = atr_percent(candles, self.config.atr_period)
         if not entry_near_ema(candles, self.config.ema_fast, atr_pct, self.config.max_ema_atr_distance):
-            logging.info("%s signal=%s blocked: price too far from EMA%s", symbol, signal, self.config.ema_fast)
+            close = candles[-1].close
+            ema = ema_values([c.close for c in candles], self.config.ema_fast)[-1]
+            distance_pct = abs(close - ema) / close if ema is not None and close > 0 else Decimal("0")
+            distance_limit_pct = (atr_pct or Decimal("0")) * self.config.max_ema_atr_distance
+            logging.info(
+                "%s signal=%s blocked: price too far from EMA%s "
+                "price=%s ema=%s distance=%.3f%% limit=%.3f%% atr=%.3f%% max_atr_distance=%s",
+                symbol,
+                signal,
+                self.config.ema_fast,
+                close,
+                ema,
+                distance_pct * Decimal("100"),
+                distance_limit_pct * Decimal("100"),
+                (atr_pct or Decimal("0")) * Decimal("100"),
+                self.config.max_ema_atr_distance,
+            )
             self.clear_pending_signal(state)
             return
         if self.config.contract_position_filter:
