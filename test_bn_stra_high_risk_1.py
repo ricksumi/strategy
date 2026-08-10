@@ -298,6 +298,23 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         self.assertEqual(state.stop_order_id, 99)
         self.assertEqual(state.stop_price, Decimal("2500"))
 
+    def test_zero_order_avg_price_is_resolved_from_trade_fills(self):
+        client = FillPriceClient()
+        bot = BnStraHighRisk1(test_config(False), client)
+
+        price = bot.resolve_order_fill_price(
+            "BMTUSDT", {"orderId": 42, "avgPrice": "0"}, Decimal("0.03430")
+        )
+
+        self.assertEqual(price, Decimal("0.03435"))
+        self.assertEqual(
+            client.calls,
+            [
+                ("GET", "/fapi/v1/order", {"symbol": "BMTUSDT", "orderId": 42}),
+                ("GET", "/fapi/v1/userTrades", {"symbol": "BMTUSDT", "orderId": 42, "limit": 1000}),
+            ],
+        )
+
     def test_was_stop_order_filled_queries_algo_order(self):
         client = RecordingClient(algo_order_response={"algoStatus": "FINISHED"})
         bot = BnStraHighRisk1(test_config(False), client)
@@ -492,6 +509,23 @@ class KlineClient(BinanceClient):
     def public_request(self, method, path, params=None):
         if method == "GET" and path == "/fapi/v1/klines":
             return self.rows
+        raise AssertionError((method, path, params))
+
+
+class FillPriceClient(BinanceClient):
+    def __init__(self):
+        self.calls = []
+
+    def signed_request(self, method, path, params=None):
+        params = params or {}
+        self.calls.append((method, path, params))
+        if method == "GET" and path == "/fapi/v1/order":
+            return {"orderId": 42, "avgPrice": "0"}
+        if method == "GET" and path == "/fapi/v1/userTrades":
+            return [
+                {"price": "0.03430", "qty": "100"},
+                {"price": "0.03440", "qty": "100"},
+            ]
         raise AssertionError((method, path, params))
 
 

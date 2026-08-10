@@ -515,9 +515,7 @@ class BnStraHighRisk1:
             symbol, side, qty, margin, stop_distance_pct, mark_price,
         )
         order = self.place_market_order(symbol, order_side, qty)
-        entry_price = Decimal(str(order.get("avgPrice", "0"))) if order else mark_price
-        if entry_price <= 0:
-            entry_price = mark_price
+        entry_price = self.resolve_order_fill_price(symbol, order, mark_price)
         stop_price = stop_price_from_distance(entry_price, side, stop_distance_pct)
         stop_price = round_stop_price(stop_price, self.rules[symbol].tick_size, side)
         try:
@@ -667,7 +665,7 @@ class BnStraHighRisk1:
             order = {"avgPrice": str(mark_price)}
         else:
             order = self.client.signed_request("POST", "/fapi/v1/order", params)
-        fill_price = Decimal(str(order.get("avgPrice", "0"))) if order else Decimal("0")
+        fill_price = self.resolve_order_fill_price(state.symbol, order, mark_price)
         state.quantity -= close_qty
         state.partial_take_1_done = state.partial_take_1_done or tier == 1
         state.partial_take_2_done = state.partial_take_2_done or tier == 2
@@ -708,6 +706,40 @@ class BnStraHighRisk1:
         state.stop_price = new_stop
         state.stop_order_id = int(order.get("algoId")) if order and order.get("algoId") else None
         state.stop_client_id = order.get("clientAlgoId") if order else None
+
+    def resolve_order_fill_price(self, symbol: str, order: dict[str, Any] | None, fallback: Decimal) -> Decimal:
+        avg_price = Decimal(str((order or {}).get("avgPrice", "0")))
+        if avg_price > 0 or self.config.dry_run:
+            return avg_price if avg_price > 0 else fallback
+
+        order_id = (order or {}).get("orderId")
+        if order_id is not None:
+            try:
+                status = self.client.signed_request(
+                    "GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}
+                )
+                avg_price = Decimal(str(status.get("avgPrice", "0")))
+                if avg_price > 0:
+                    return avg_price
+                trades = self.client.signed_request(
+                    "GET", "/fapi/v1/userTrades", {"symbol": symbol, "orderId": order_id, "limit": 1000}
+                )
+                total_qty = sum((Decimal(str(row.get("qty", "0"))) for row in trades), Decimal("0"))
+                if total_qty > 0:
+                    total_notional = sum(
+                        (
+                            Decimal(str(row.get("price", "0"))) * Decimal(str(row.get("qty", "0")))
+                            for row in trades
+                        ),
+                        Decimal("0"),
+                    )
+                    if total_notional > 0:
+                        return total_notional / total_qty
+            except Exception as exc:
+                logging.warning("%s could not resolve fill price for order_id=%s: %s", symbol, order_id, exc)
+
+        logging.warning("%s order_id=%s returned no fill price; using fallback=%s", symbol, order_id, fallback)
+        return fallback
 
     def on_position_closed(self, state: PositionState) -> None:
         close_side = state.side
