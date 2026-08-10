@@ -16,6 +16,7 @@ from bn_stra_high_risk_1 import (
     atr_percent,
     atr_size_factor,
     breakeven_stop_price,
+    capped_atr_stop_distance,
     ema_values,
     improve_stop,
     initial_stop_price,
@@ -86,6 +87,11 @@ class BnStraHighRisk1Tests(unittest.TestCase):
     def test_dynamic_confirmation_uses_larger_atr_threshold(self):
         self.assertEqual(dynamic_confirm_pct(Decimal("0.004"), Decimal("0.02"), Decimal("0.15")), Decimal("0.004"))
         self.assertEqual(dynamic_confirm_pct(Decimal("0.004"), Decimal("0.05"), Decimal("0.15")), Decimal("0.0075"))
+
+    def test_atr_stop_distance_never_exceeds_configured_roi_cap(self):
+        cap = Decimal("0.10") / Decimal("5")
+        self.assertEqual(capped_atr_stop_distance(cap, Decimal("0.005"), Decimal("1.5")), Decimal("0.0075"))
+        self.assertEqual(capped_atr_stop_distance(cap, Decimal("0.04"), Decimal("1.5")), cap)
 
     def test_contract_position_filter_blocks_squeeze_risk(self):
         args = (Decimal("0.65"), Decimal("1.20"), Decimal("1.55"), Decimal("0.83"))
@@ -227,6 +233,19 @@ class BnStraHighRisk1Tests(unittest.TestCase):
 
         config.validate()
 
+    def test_fetch_candles_excludes_current_unclosed_kline(self):
+        rows = [
+            [0, "100", "101", "99", "100.5", "0", 999],
+            [1000, "100.5", "102", "100", "101", "0", 1999],
+        ]
+        bot = BnStraHighRisk1(test_config(False), KlineClient(rows))
+
+        with patch("bn_stra_high_risk_1.time.time", return_value=1.5):
+            candles = bot.fetch_candles("ETHUSDT")
+
+        self.assertEqual(len(candles), 1)
+        self.assertEqual(candles[0].close_time, 999)
+
     def test_stop_order_uses_algo_endpoint(self):
         client = RecordingClient()
         bot = BnStraHighRisk1(test_config(False), client)
@@ -242,7 +261,7 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         self.assertEqual(client.calls[-1][2]["reduceOnly"], "true")
         self.assertIn("clientAlgoId", client.calls[-1][2])
 
-    def test_replace_stop_order_cancels_algo_order_with_symbol(self):
+    def test_replace_stop_order_places_new_protection_before_canceling_old(self):
         client = RecordingClient()
         bot = BnStraHighRisk1(test_config(False), client)
         bot.rules = {"ETHUSDT": SymbolRules(tick_size=Decimal("0.01"), step_size=Decimal("0.001"), min_qty=Decimal("0"))}
@@ -256,9 +275,28 @@ class BnStraHighRisk1Tests(unittest.TestCase):
 
         bot.replace_stop_order(state, Decimal("2510"))
 
-        self.assertEqual(client.calls[0], ("DELETE", "/fapi/v1/algoOrder", {"symbol": "ETHUSDT", "algoId": 99}))
-        self.assertEqual(client.calls[1][1], "/fapi/v1/algoOrder")
+        self.assertEqual(client.calls[0][0:2], ("POST", "/fapi/v1/algoOrder"))
+        self.assertEqual(client.calls[1], ("DELETE", "/fapi/v1/algoOrder", {"symbol": "ETHUSDT", "algoId": 99}))
         self.assertEqual(state.stop_order_id, 123)
+
+    def test_replace_stop_order_keeps_old_protection_when_new_order_fails(self):
+        client = FailingStopClient()
+        bot = BnStraHighRisk1(test_config(False), client)
+        state = PositionState(
+            symbol="ETHUSDT",
+            side="long",
+            quantity=Decimal("0.25"),
+            stop_price=Decimal("2500"),
+            stop_order_id=99,
+            stop_client_id="old",
+        )
+
+        with self.assertRaises(RuntimeError):
+            bot.replace_stop_order(state, Decimal("2510"))
+
+        self.assertEqual(client.calls, [("POST", "/fapi/v1/algoOrder")])
+        self.assertEqual(state.stop_order_id, 99)
+        self.assertEqual(state.stop_price, Decimal("2500"))
 
     def test_was_stop_order_filled_queries_algo_order(self):
         client = RecordingClient(algo_order_response={"algoStatus": "FINISHED"})
@@ -295,6 +333,25 @@ class BnStraHighRisk1Tests(unittest.TestCase):
                 bot.on_position_closed(state)
 
         self.assertEqual(state.daily_stop_count, 1)
+
+    def test_profit_stop_does_not_increment_daily_stop_count(self):
+        with TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            client = RecordingClient(algo_order_response={"algoStatus": "FINISHED"})
+            with patch.dict("os.environ", {"BN_STRA_STATE_FILE": str(state_file)}):
+                bot = BnStraHighRisk1(test_config(False), client)
+                state = PositionState(
+                    symbol="ETHUSDT",
+                    side="long",
+                    entry_price=Decimal("100"),
+                    quantity=Decimal("1"),
+                    stop_price=Decimal("101"),
+                    stop_client_id="cid",
+                    stop_reason="trailing_stop",
+                )
+                bot.on_position_closed(state)
+
+        self.assertEqual(state.daily_stop_count, 0)
 
     def test_load_env_file_sets_missing_values(self):
         with TemporaryDirectory() as tmpdir:
@@ -414,6 +471,27 @@ class InsufficientMarginClient(BinanceClient):
             return {"totalMarginBalance": "1000", "availableBalance": "10"}
         if method == "POST" and path == "/fapi/v1/order":
             self.market_orders += 1
+        raise AssertionError((method, path, params))
+
+
+class FailingStopClient(BinanceClient):
+    def __init__(self):
+        self.calls = []
+
+    def signed_request(self, method, path, params=None):
+        self.calls.append((method, path))
+        if method == "POST" and path == "/fapi/v1/algoOrder":
+            raise RuntimeError("simulated new stop failure")
+        raise AssertionError((method, path, params))
+
+
+class KlineClient(BinanceClient):
+    def __init__(self, rows):
+        self.rows = rows
+
+    def public_request(self, method, path, params=None):
+        if method == "GET" and path == "/fapi/v1/klines":
+            return self.rows
         raise AssertionError((method, path, params))
 
 

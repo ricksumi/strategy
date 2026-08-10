@@ -62,7 +62,7 @@ When the signal window expires, the bot starts a new window from the latest qual
 ```text
 Base margin per position = configured margin_per_trade (default 200 USDT)
 Leverage = 5x
-Initial stop distance = max(2% of price, 1.5 * ATR percentage)
+Initial stop distance = min(2% of price, 1.5 * ATR percentage)
 ATR never changes margin or order quantity
 ```
 
@@ -70,7 +70,7 @@ At full size, `200 USDT` of margin with 5x leverage controls approximately `1,00
 
 The legacy `allocation_fraction` field is accepted for configuration compatibility but does not control live position margin. Before an order is placed, the bot checks Binance `availableBalance`. If it cannot cover the configured margin plus an opening-fee allowance, the order is skipped and a rate-limited Hermes notification is queued.
 
-A wider ATR stop increases the planned USDT loss because margin remains fixed. For example, a `200 USDT` margin position at 5x leverage with a 5% price stop risks approximately `50 USDT` before fees and slippage.
+The configured `stop_loss_roi` is a hard initial-loss cap before fees and slippage. With the default `10%` ROI cap, `200 USDT` margin risks at most approximately `20 USDT` before fees and slippage. ATR may tighten the stop but cannot widen it beyond that cap.
 
 ## Exit management
 

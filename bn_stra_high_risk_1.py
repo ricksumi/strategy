@@ -468,7 +468,7 @@ class BnStraHighRisk1:
         if not self.pullback_entry_ready(state, signal, candles[-1].close, confirm_pct):
             return
         base_stop_pct = self.config.stop_loss_roi / Decimal(self.config.leverage)
-        stop_distance_pct = max(base_stop_pct, atr_pct * self.config.atr_stop_multiplier)
+        stop_distance_pct = capped_atr_stop_distance(base_stop_pct, atr_pct, self.config.atr_stop_multiplier)
         self.open_position(symbol, signal, stop_distance_pct)
 
     def open_position(
@@ -671,11 +671,12 @@ class BnStraHighRisk1:
         state.quantity -= close_qty
         state.partial_take_1_done = state.partial_take_1_done or tier == 1
         state.partial_take_2_done = state.partial_take_2_done or tier == 2
-        if state.stop_order_id is not None:
-            self.cancel_stop_order(state.symbol, state.stop_order_id)
+        stop_order = self.place_stop_order(state.symbol, state.side or "long", state.quantity, state.stop_price, "managed")
+        old_stop_order_id = state.stop_order_id
+        if old_stop_order_id is not None:
+            self.cancel_stop_order(state.symbol, old_stop_order_id)
         else:
             self.cancel_algo_open_orders(state.symbol)
-        stop_order = self.place_stop_order(state.symbol, state.side or "long", state.quantity, state.stop_price, "managed")
         state.stop_order_id = int(stop_order.get("algoId")) if stop_order and stop_order.get("algoId") else None
         state.stop_client_id = stop_order.get("clientAlgoId") if stop_order else None
         self.save_runtime_state()
@@ -700,9 +701,10 @@ class BnStraHighRisk1:
         )
 
     def replace_stop_order(self, state: PositionState, new_stop: Decimal) -> None:
-        if state.stop_order_id is not None:
-            self.cancel_stop_order(state.symbol, state.stop_order_id)
         order = self.place_stop_order(state.symbol, state.side or "long", state.quantity, new_stop, "managed")
+        old_stop_order_id = state.stop_order_id
+        if old_stop_order_id is not None:
+            self.cancel_stop_order(state.symbol, old_stop_order_id)
         state.stop_price = new_stop
         state.stop_order_id = int(order.get("algoId")) if order and order.get("algoId") else None
         state.stop_client_id = order.get("clientAlgoId") if order else None
@@ -731,7 +733,7 @@ class BnStraHighRisk1:
         if not stop_filled and state.stop_reason == "stop_loss" and state.stop_client_id:
             stop_filled = True
             logging.info("%s stop order not confirmed yet; counting stop_loss conservatively", state.symbol)
-        if stop_filled:
+        if stop_filled and state.stop_reason == "stop_loss":
             state.daily_stop_count += 1
             self.save_runtime_state()
             logging.info("%s stop count today=%s", state.symbol, state.daily_stop_count)
@@ -992,7 +994,7 @@ class BnStraHighRisk1:
         rows = self.client.public_request(
             "GET", "/fapi/v1/klines", {"symbol": symbol, "interval": self.config.interval, "limit": self.config.kline_limit}
         )
-        return [
+        candles = [
             Candle(
                 open_time=int(row[0]),
                 open=Decimal(row[1]),
@@ -1003,6 +1005,8 @@ class BnStraHighRisk1:
             )
             for row in rows
         ]
+        now_ms = int(time.time() * 1000)
+        return [candle for candle in candles if candle.close_time < now_ms]
 
     def get_mark_price(self, symbol: str) -> Decimal:
         data = self.client.public_request("GET", "/fapi/v1/premiumIndex", {"symbol": symbol})
@@ -1434,6 +1438,10 @@ def dynamic_confirm_pct(base_pct: Decimal, atr_pct: Decimal | None, atr_factor: 
     if atr_pct is None:
         return base_pct
     return max(base_pct, atr_pct * atr_factor)
+
+
+def capped_atr_stop_distance(base_stop_pct: Decimal, atr_pct: Decimal, atr_multiplier: Decimal) -> Decimal:
+    return min(base_stop_pct, atr_pct * atr_multiplier)
 
 
 def entry_near_ema(
