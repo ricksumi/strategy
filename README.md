@@ -27,12 +27,15 @@ K-line interval: 5m
 EMA20 > EMA60: long only
 EMA20 < EMA60: short only
 ADX14 > 30: entry allowed
+ADX14 must be flat or rising versus the previous closed candle
 0.5% <= ATR14 / close <= 6%: entry allowed
 Otherwise: no entry
 Price distance from EMA20 must not exceed 1.5 ATR
 ```
 
 The bot also rejects a short when the global account long/short ratio is at or below `0.65` while the top-trader position ratio is at or above `1.20`. The inverse crowded-long condition rejects longs when the global ratio is at or above `1.55` and the top-trader ratio is at or below `0.83`.
+
+An independent top-trader veto also rejects longs when the top-trader position ratio is at or below `0.80`, and rejects shorts when it is at or above `1.25`.
 
 ## Entry flow
 
@@ -54,7 +57,8 @@ When the signal window expires, the bot starts a new window from the latest qual
 ```text
 Margin per position = current USDT totalMarginBalance / configured symbol count
 Leverage = 5x
-Initial stop = -10% margin ROI, approximately a 2% adverse price move
+Initial stop distance = max(2% of price, 1.5 * ATR percentage)
+Position size is reduced when the ATR stop exceeds 2%, keeping planned USDT risk approximately unchanged
 ```
 
 For example, with `1,500 USDT` of equity and five configured symbols, each new position uses approximately `300 USDT` of margin and controls approximately `1,500 USDT` of notional exposure.

@@ -66,12 +66,15 @@ class BotConfig:
     atr_reduced_size_factor: Decimal
     atr_high_size_factor: Decimal
     atr_confirm_factor: Decimal
+    atr_stop_multiplier: Decimal
     max_ema_atr_distance: Decimal
     contract_position_filter: bool
     crowded_short_global_max: Decimal
     crowded_short_top_min: Decimal
     crowded_long_global_min: Decimal
     crowded_long_top_max: Decimal
+    top_long_veto_max: Decimal
+    top_short_veto_min: Decimal
     stop_update_min_pct: Decimal
     daily_stop_limit: int
     cooldown_seconds: int
@@ -125,12 +128,15 @@ class BotConfig:
             atr_reduced_size_factor=Decimal(str(raw.get("atr_reduced_size_factor", "0.70"))),
             atr_high_size_factor=Decimal(str(raw.get("atr_high_size_factor", "0.40"))),
             atr_confirm_factor=Decimal(str(raw.get("atr_confirm_factor", "0.15"))),
+            atr_stop_multiplier=Decimal(str(raw.get("atr_stop_multiplier", "1.5"))),
             max_ema_atr_distance=Decimal(str(raw.get("max_ema_atr_distance", "1.5"))),
             contract_position_filter=bool(raw.get("contract_position_filter", True)),
             crowded_short_global_max=Decimal(str(raw.get("crowded_short_global_max", "0.65"))),
             crowded_short_top_min=Decimal(str(raw.get("crowded_short_top_min", "1.20"))),
             crowded_long_global_min=Decimal(str(raw.get("crowded_long_global_min", "1.55"))),
             crowded_long_top_max=Decimal(str(raw.get("crowded_long_top_max", "0.83"))),
+            top_long_veto_max=Decimal(str(raw.get("top_long_veto_max", "0.80"))),
+            top_short_veto_min=Decimal(str(raw.get("top_short_veto_min", "1.25"))),
             stop_update_min_pct=Decimal(str(raw.get("stop_update_min_pct", "0.002"))),
             daily_stop_limit=int(raw.get("daily_stop_limit", 3)),
             cooldown_seconds=int(raw.get("cooldown_seconds", 600)),
@@ -191,6 +197,8 @@ class BotConfig:
             raise ValueError("ATR size factors must be in (0, 1]")
         if self.atr_confirm_factor < 0 or self.max_ema_atr_distance <= 0:
             raise ValueError("ATR confirmation factor must be non-negative and EMA distance must be positive")
+        if self.atr_stop_multiplier <= 0:
+            raise ValueError("atr_stop_multiplier must be positive")
         if self.stop_update_min_pct < 0:
             raise ValueError("stop_update_min_pct cannot be negative")
         if self.working_type not in {"MARK_PRICE", "CONTRACT_PRICE"}:
@@ -419,6 +427,8 @@ class BnStraHighRisk1:
                 self.config.crowded_short_top_min,
                 self.config.crowded_long_global_min,
                 self.config.crowded_long_top_max,
+                self.config.top_long_veto_max,
+                self.config.top_short_veto_min,
             ):
                 logging.info(
                     "%s signal=%s blocked: contract positioning global_ls=%s top_position_ls=%s",
@@ -439,9 +449,18 @@ class BnStraHighRisk1:
             self.config.atr_reduced_size_factor,
             self.config.atr_high_size_factor,
         )
-        self.open_position(symbol, signal, size_factor)
+        base_stop_pct = self.config.stop_loss_roi / Decimal(self.config.leverage)
+        stop_distance_pct = max(base_stop_pct, atr_pct * self.config.atr_stop_multiplier)
+        risk_size_factor = base_stop_pct / stop_distance_pct
+        self.open_position(symbol, signal, size_factor * risk_size_factor, stop_distance_pct)
 
-    def open_position(self, symbol: str, side: str, size_factor: Decimal = Decimal("1")) -> None:
+    def open_position(
+        self,
+        symbol: str,
+        side: str,
+        size_factor: Decimal = Decimal("1"),
+        stop_distance_pct: Decimal | None = None,
+    ) -> None:
         equity = self.get_total_usdt_equity()
         margin = self.margin_per_symbol(equity) * size_factor
         mark_price = self.get_mark_price(symbol)
@@ -451,12 +470,16 @@ class BnStraHighRisk1:
             return
 
         order_side = "BUY" if side == "long" else "SELL"
-        logging.info("%s opening %s qty=%s margin=%s size_factor=%s mark=%s", symbol, side, qty, margin, size_factor, mark_price)
+        stop_distance_pct = stop_distance_pct or self.config.stop_loss_roi / Decimal(self.config.leverage)
+        logging.info(
+            "%s opening %s qty=%s margin=%s size_factor=%s stop_distance_pct=%s mark=%s",
+            symbol, side, qty, margin, size_factor, stop_distance_pct, mark_price,
+        )
         order = self.place_market_order(symbol, order_side, qty)
         entry_price = Decimal(str(order.get("avgPrice", "0"))) if order else mark_price
         if entry_price <= 0:
             entry_price = mark_price
-        stop_price = initial_stop_price(entry_price, side, self.config.stop_loss_roi, self.config.leverage)
+        stop_price = stop_price_from_distance(entry_price, side, stop_distance_pct)
         stop_price = round_stop_price(stop_price, self.rules[symbol].tick_size, side)
         try:
             stop_order = self.place_stop_order(symbol, side, qty, stop_price, "initial")
@@ -1172,8 +1195,18 @@ def strategy_signal(
         return "none"
     fast = ema_values([c.close for c in candles], ema_fast)[-1]
     slow = ema_values([c.close for c in candles], ema_slow)[-1]
-    adx = adx_values(candles, adx_period)[-1]
-    if fast is None or slow is None or adx is None or adx <= adx_min or fast == slow:
+    adx_series = adx_values(candles, adx_period)
+    adx = adx_series[-1]
+    previous_adx = adx_series[-2] if len(adx_series) >= 2 else None
+    if (
+        fast is None
+        or slow is None
+        or adx is None
+        or previous_adx is None
+        or adx <= adx_min
+        or adx < previous_adx
+        or fast == slow
+    ):
         return "none"
     atr_pct = atr_percent(candles, atr_period)
     if atr_pct is None:
@@ -1257,7 +1290,11 @@ def adx_values(candles: list[Candle], period: int) -> list[Decimal | None]:
 
 def initial_stop_price(entry: Decimal, side: str, stop_loss_roi: Decimal, leverage: int) -> Decimal:
     move = stop_loss_roi / Decimal(leverage)
-    return entry * (Decimal("1") - move) if side == "long" else entry * (Decimal("1") + move)
+    return stop_price_from_distance(entry, side, move)
+
+
+def stop_price_from_distance(entry: Decimal, side: str, distance_pct: Decimal) -> Decimal:
+    return entry * (Decimal("1") - distance_pct) if side == "long" else entry * (Decimal("1") + distance_pct)
 
 
 def profit_trigger_price(entry: Decimal, side: str, roi: Decimal, leverage: int) -> Decimal:
@@ -1378,7 +1415,13 @@ def contract_position_allows(
     crowded_short_top_min: Decimal,
     crowded_long_global_min: Decimal,
     crowded_long_top_max: Decimal,
+    top_long_veto_max: Decimal = Decimal("0"),
+    top_short_veto_min: Decimal = Decimal("999"),
 ) -> bool:
+    if side == "long" and top_ratio <= top_long_veto_max:
+        return False
+    if side == "short" and top_ratio >= top_short_veto_min:
+        return False
     if side == "short" and global_ratio <= crowded_short_global_max and top_ratio >= crowded_short_top_min:
         return False
     if side == "long" and global_ratio >= crowded_long_global_min and top_ratio <= crowded_long_top_max:

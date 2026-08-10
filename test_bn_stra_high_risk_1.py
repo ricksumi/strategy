@@ -93,6 +93,9 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         self.assertFalse(contract_position_allows("long", Decimal("1.60"), Decimal("0.80"), *args))
         self.assertTrue(contract_position_allows("long", Decimal("0.60"), Decimal("1.40"), *args))
         self.assertTrue(contract_position_allows("short", Decimal("1.60"), Decimal("0.80"), *args))
+        veto_args = (*args, Decimal("0.80"), Decimal("1.25"))
+        self.assertFalse(contract_position_allows("long", Decimal("1.00"), Decimal("0.75"), *veto_args))
+        self.assertFalse(contract_position_allows("short", Decimal("1.00"), Decimal("1.30"), *veto_args))
 
     def test_entry_distance_from_ema_is_limited_by_atr(self):
         candles = [
@@ -421,12 +424,15 @@ def test_config(dry_run=True, symbols=("ETHUSDT",), interval="5m"):
         atr_reduced_size_factor=Decimal("0.70"),
         atr_high_size_factor=Decimal("0.40"),
         atr_confirm_factor=Decimal("0.15"),
+        atr_stop_multiplier=Decimal("1.5"),
         max_ema_atr_distance=Decimal("1.5"),
         contract_position_filter=True,
         crowded_short_global_max=Decimal("0.65"),
         crowded_short_top_min=Decimal("1.20"),
         crowded_long_global_min=Decimal("1.55"),
         crowded_long_top_max=Decimal("0.83"),
+        top_long_veto_max=Decimal("0.80"),
+        top_short_veto_min=Decimal("1.25"),
         stop_update_min_pct=Decimal("0.002"),
         daily_stop_limit=3,
         cooldown_seconds=600,
