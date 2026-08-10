@@ -8,16 +8,17 @@ The example configuration defaults to `dry_run: true` and does not place real or
 
 This strategy can lose money quickly. It uses leverage, market orders, conditional stop orders, and dynamic stop replacement. Network latency, API errors, slippage, funding fees, liquidation rules, exchange outages, and symbol-specific trading limits can materially change results.
 
-The current sizing rule allocates account margin across the configured symbol count. With five symbols, each new position uses approximately 20% of current account equity as margin. Do not run it with funds you cannot afford to lose.
+The current sizing rule allocates account margin across the configured symbol count. With six symbols, each new position uses approximately one sixth of current account equity as margin. Do not run it with funds you cannot afford to lose.
 
 ## Default symbols
 
 ```text
-TUTUSDT
 BMTUSDT
+TUTUSDT
 MUBARAKUSDT
-COOKIEUSDT
-IOTXUSDT
+NILUSDT
+CAPUSDT
+PEOPLEUSDT
 ```
 
 ## Signal filters
@@ -57,7 +58,7 @@ Leverage = 5x
 Initial stop = -10% margin ROI, approximately a 2% adverse price move
 ```
 
-For example, with `1,500 USDT` of equity and five configured symbols, each new position uses approximately `300 USDT` of margin and controls approximately `1,500 USDT` of notional exposure.
+For example, with `1,500 USDT` of equity and six configured symbols, each new position uses approximately `250 USDT` of margin and controls approximately `1,250 USDT` of notional exposure.
 
 The legacy `allocation_fraction` field is accepted for configuration compatibility but does not control live position margin.
 

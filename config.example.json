@@ -1,7 +1,7 @@
 {
   "strategy": "bn-stra-high-risk-1",
   "strategy_mode": "high_vol",
-  "symbols": ["TUTUSDT", "BMTUSDT", "MUBARAKUSDT", "COOKIEUSDT", "IOTXUSDT"],
+  "symbols": ["BMTUSDT", "TUTUSDT", "MUBARAKUSDT", "NILUSDT", "CAPUSDT", "PEOPLEUSDT"],
   "interval": "5m",
   "leverage": 5,
   "stop_loss_roi": "0.10",
