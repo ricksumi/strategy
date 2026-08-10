@@ -188,7 +188,21 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         config = test_config(False, symbols=("BTCUSDT", "SOLUSDT", "ETHUSDT"))
         bot = BnStraHighRisk1(config, FakeClient([]))
 
-        self.assertEqual(bot.margin_per_symbol(Decimal("1500")), Decimal("500"))
+        self.assertEqual(bot.margin_per_symbol(Decimal("1500")), Decimal("200"))
+
+    def test_insufficient_margin_notifies_without_placing_order(self):
+        with TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            with patch.dict("os.environ", {"BN_STRA_STATE_FILE": str(state_file)}):
+                client = InsufficientMarginClient()
+                bot = BnStraHighRisk1(test_config(False), client)
+                notifier = RecordingNotifier()
+                bot.notifier = notifier
+                bot.open_position("ETHUSDT", "long")
+
+            self.assertEqual(client.market_orders, 0)
+            self.assertEqual(len(notifier.messages), 1)
+            self.assertIn("[INSUFFICIENT MARGIN] ETHUSDT LONG", notifier.messages[0])
 
     def test_non_entry_managed_symbol_does_not_open_after_close(self):
         with TemporaryDirectory() as tmpdir, patch.dict(
@@ -388,6 +402,26 @@ class RecordingClient(BinanceClient):
         raise AssertionError((method, path, params))
 
 
+class InsufficientMarginClient(BinanceClient):
+    def __init__(self):
+        self.market_orders = 0
+
+    def signed_request(self, method, path, params=None):
+        if path == "/fapi/v2/account":
+            return {"totalMarginBalance": "1000", "availableBalance": "10"}
+        if method == "POST" and path == "/fapi/v1/order":
+            self.market_orders += 1
+        raise AssertionError((method, path, params))
+
+
+class RecordingNotifier:
+    def __init__(self):
+        self.messages = []
+
+    def send(self, message):
+        self.messages.append(message)
+
+
 def test_config(dry_run=True, symbols=("ETHUSDT",), interval="5m"):
     return BotConfig(
         symbols=symbols,
@@ -395,6 +429,7 @@ def test_config(dry_run=True, symbols=("ETHUSDT",), interval="5m"):
         interval=interval,
         leverage=5,
         allocation_fraction=Decimal("0.2"),
+        margin_per_trade=Decimal("200"),
         stop_loss_roi=Decimal("0.10"),
         breakeven_roi=Decimal("0.10"),
         profit_lock_roi=Decimal("0.03"),

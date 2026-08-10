@@ -37,6 +37,7 @@ class BotConfig:
     interval: str
     leverage: int
     allocation_fraction: Decimal
+    margin_per_trade: Decimal
     stop_loss_roi: Decimal
     breakeven_roi: Decimal
     profit_lock_roi: Decimal
@@ -85,6 +86,7 @@ class BotConfig:
     dry_run: bool
     testnet: bool
     recv_window: int
+    insufficient_margin_notice_cooldown_seconds: int = 600
     hermes_enabled: bool = False
     hermes_socket_path: str = ""
     hermes_target: str = "weixin"
@@ -99,6 +101,7 @@ class BotConfig:
             interval=str(raw.get("interval", "5m")),
             leverage=int(raw.get("leverage", 5)),
             allocation_fraction=Decimal(str(raw.get("allocation_fraction", "0.2"))),
+            margin_per_trade=Decimal(str(raw.get("margin_per_trade", "200"))),
             stop_loss_roi=Decimal(str(raw.get("stop_loss_roi", "0.10"))),
             breakeven_roi=Decimal(str(raw.get("breakeven_roi", "0.10"))),
             profit_lock_roi=Decimal(str(raw.get("profit_lock_roi", "0"))),
@@ -147,6 +150,9 @@ class BotConfig:
             dry_run=bool(raw.get("dry_run", True)),
             testnet=bool(raw.get("testnet", True)),
             recv_window=int(raw.get("recv_window", 5000)),
+            insufficient_margin_notice_cooldown_seconds=int(
+                raw.get("insufficient_margin_notice_cooldown_seconds", 600)
+            ),
             hermes_enabled=bool(raw.get("hermes_enabled", False)),
             hermes_socket_path=str(raw.get("hermes_socket_path", "")),
             hermes_target=str(raw.get("hermes_target", "weixin")),
@@ -163,6 +169,8 @@ class BotConfig:
             raise ValueError("leverage must be positive")
         if self.allocation_fraction <= 0 or self.allocation_fraction > 1:
             raise ValueError("allocation_fraction must be in (0, 1]")
+        if self.margin_per_trade <= 0:
+            raise ValueError("margin_per_trade must be positive")
         if self.ema_fast >= self.ema_slow:
             raise ValueError("ema_fast must be lower than ema_slow")
         if self.fee_rate < 0:
@@ -254,6 +262,7 @@ class PositionState:
     initial_quantity: Decimal = Decimal("0")
     partial_take_1_done: bool = False
     partial_take_2_done: bool = False
+    last_insufficient_margin_notice: float = 0
 
 
 class HermesNotifier:
@@ -461,8 +470,32 @@ class BnStraHighRisk1:
         size_factor: Decimal = Decimal("1"),
         stop_distance_pct: Decimal | None = None,
     ) -> None:
-        equity = self.get_total_usdt_equity()
-        margin = self.margin_per_symbol(equity) * size_factor
+        equity, available_balance = self.get_usdt_account_balances()
+        margin = self.config.margin_per_trade * size_factor
+        required_available = margin * (Decimal("1") + self.config.fee_rate * Decimal(self.config.leverage))
+        if available_balance < required_available:
+            state = self.states[symbol]
+            now = time.time()
+            logging.warning(
+                "%s insufficient margin side=%s required=%s available=%s base_margin=%s size_factor=%s",
+                symbol, side, required_available, available_balance, self.config.margin_per_trade, size_factor,
+            )
+            if now - state.last_insufficient_margin_notice >= self.config.insufficient_margin_notice_cooldown_seconds:
+                self.notifier.send(
+                    "\n".join(
+                        [
+                            f"[INSUFFICIENT MARGIN] {symbol} {side.upper()}",
+                            f"Required available balance: {required_available:.4f} USDT",
+                            f"Available balance: {available_balance:.4f} USDT",
+                            f"Configured base margin: {self.config.margin_per_trade:.4f} USDT",
+                            f"Risk size factor: {size_factor:.4f}",
+                            "Order was not placed.",
+                        ]
+                    )
+                )
+                state.last_insufficient_margin_notice = now
+            self.clear_pending_signal(state)
+            return
         mark_price = self.get_mark_price(symbol)
         qty = round_to_step((margin * Decimal(self.config.leverage)) / mark_price, self.rules[symbol].step_size)
         if qty < self.rules[symbol].min_qty:
@@ -521,7 +554,7 @@ class BnStraHighRisk1:
         self.notify_position_opened(state)
 
     def margin_per_symbol(self, equity: Decimal) -> Decimal:
-        return equity / Decimal(len(self.config.symbols))
+        return self.config.margin_per_trade
 
     def manage_open_position(self, state: PositionState, mark_price: Decimal) -> None:
         assert state.side is not None
@@ -978,10 +1011,13 @@ class BnStraHighRisk1:
         return Decimal(global_rows[-1]["longShortRatio"]), Decimal(top_rows[-1]["longShortRatio"])
 
     def get_total_usdt_equity(self) -> Decimal:
+        return self.get_usdt_account_balances()[0]
+
+    def get_usdt_account_balances(self) -> tuple[Decimal, Decimal]:
         if self.config.dry_run:
-            return Decimal("10000")
+            return Decimal("10000"), Decimal("10000")
         account = self.client.signed_request("GET", "/fapi/v2/account")
-        return Decimal(account["totalMarginBalance"])
+        return Decimal(account["totalMarginBalance"]), Decimal(account["availableBalance"])
 
     def get_position(self, symbol: str) -> dict[str, Any]:
         if self.config.dry_run:
