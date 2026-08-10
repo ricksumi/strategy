@@ -43,6 +43,10 @@ class BotConfig:
     fee_rate: Decimal
     trailing_activation_roi: Decimal
     trailing_callback: Decimal
+    trailing_tier_2_roi: Decimal
+    trailing_tier_2_callback: Decimal
+    trailing_tier_3_roi: Decimal
+    trailing_tier_3_callback: Decimal
     pullback_entry_pct: Decimal
     pullback_confirm_pct: Decimal
     pullback_signal_wait_seconds: int
@@ -94,6 +98,10 @@ class BotConfig:
             fee_rate=Decimal(str(raw.get("fee_rate", "0.0004"))),
             trailing_activation_roi=Decimal(str(raw.get("trailing_activation_roi", "0.20"))),
             trailing_callback=Decimal(str(raw.get("trailing_callback", "0.015"))),
+            trailing_tier_2_roi=Decimal(str(raw.get("trailing_tier_2_roi", "0.50"))),
+            trailing_tier_2_callback=Decimal(str(raw.get("trailing_tier_2_callback", "0.03"))),
+            trailing_tier_3_roi=Decimal(str(raw.get("trailing_tier_3_roi", "0.80"))),
+            trailing_tier_3_callback=Decimal(str(raw.get("trailing_tier_3_callback", "0.02"))),
             pullback_entry_pct=Decimal(str(raw.get("pullback_entry_pct", "0"))),
             pullback_confirm_pct=Decimal(str(raw.get("pullback_confirm_pct", "0"))),
             pullback_signal_wait_seconds=int(raw.get("pullback_signal_wait_seconds", 0)),
@@ -147,6 +155,10 @@ class BotConfig:
             raise ValueError("fee_rate cannot be negative")
         if self.profit_lock_roi < 0 or self.profit_lock_roi >= self.breakeven_roi:
             raise ValueError("profit_lock_roi must be non-negative and lower than breakeven_roi")
+        if not (self.trailing_activation_roi < self.trailing_tier_2_roi < self.trailing_tier_3_roi):
+            raise ValueError("trailing ROI tiers must be strictly increasing")
+        if not (self.trailing_callback >= self.trailing_tier_2_callback >= self.trailing_tier_3_callback > 0):
+            raise ValueError("trailing callbacks must be positive and non-increasing")
         if self.pullback_entry_pct < 0:
             raise ValueError("pullback_entry_pct cannot be negative")
         if self.pullback_confirm_pct < 0:
@@ -493,14 +505,24 @@ class BnStraHighRisk1:
             new_stop = improve_stop(new_stop, profit_lock_stop, state.side)
             move_reasons.append("profit_lock")
 
-        if reached_profit_trigger(mark_price, state.side, trailing_trigger):
+        best_roi = margin_roi(state.best_price, state.entry_price, state.side, self.config.leverage)
+        active_callback = trailing_callback_for_roi(
+            best_roi,
+            self.config.trailing_activation_roi,
+            self.config.trailing_callback,
+            self.config.trailing_tier_2_roi,
+            self.config.trailing_tier_2_callback,
+            self.config.trailing_tier_3_roi,
+            self.config.trailing_tier_3_callback,
+        )
+        if active_callback is not None:
             state.trailing_active = True
             if state.side == "long":
-                trailing_stop = state.best_price * (Decimal("1") - self.config.trailing_callback)
+                trailing_stop = state.best_price * (Decimal("1") - active_callback)
             else:
-                trailing_stop = state.best_price * (Decimal("1") + self.config.trailing_callback)
+                trailing_stop = state.best_price * (Decimal("1") + active_callback)
             new_stop = improve_stop(new_stop, trailing_stop, state.side)
-            move_reasons.append("trailing")
+            move_reasons.append(f"trailing_{active_callback}")
 
         new_stop = round_stop_price(new_stop, self.rules[state.symbol].tick_size, state.side)
         if stop_improved_by(new_stop, state.stop_price, state.side, self.config.stop_update_min_pct):
@@ -509,10 +531,11 @@ class BnStraHighRisk1:
             elif state.breakeven_done:
                 state.stop_reason = "break_even"
             self.replace_stop_order(state, new_stop)
+            self.save_runtime_state()
             logging.info(
                 (
                     "%s stop moved reason=%s side=%s entry=%s mark=%s best=%s margin_roi=%s "
-                    "breakeven_trigger=%s trailing_trigger=%s old_stop=%s new_stop=%s "
+                    "breakeven_trigger=%s trailing_trigger=%s best_roi=%s callback=%s old_stop=%s new_stop=%s "
                     "old_algo_id=%s new_algo_id=%s old_client_id=%s new_client_id=%s stop_reason=%s"
                 ),
                 state.symbol,
@@ -524,6 +547,8 @@ class BnStraHighRisk1:
                 margin_roi(mark_price, state.entry_price, state.side, self.config.leverage),
                 breakeven_trigger,
                 trailing_trigger,
+                best_roi,
+                active_callback,
                 old_stop,
                 state.stop_price,
                 old_stop_order_id,
@@ -882,8 +907,10 @@ class BnStraHighRisk1:
             state.side = side
             state.quantity = abs(amt)
             state.entry_price = entry
-            state.best_price = entry
-            state.stop_price = initial_stop_price(entry, side, self.config.stop_loss_roi, self.config.leverage)
+            if state.best_price <= 0:
+                state.best_price = entry
+            if state.stop_price <= 0:
+                state.stop_price = initial_stop_price(entry, side, self.config.stop_loss_roi, self.config.leverage)
             if state.opened_at_ms <= 0:
                 state.opened_at_ms = int(time.time() * 1000)
             if state.initial_margin <= 0:
@@ -993,6 +1020,13 @@ class BnStraHighRisk1:
                 state = self.states[symbol]
                 state.opened_at_ms = max(0, int(raw_trade.get("opened_at_ms", 0)))
                 state.initial_margin = max(Decimal("0"), Decimal(str(raw_trade.get("initial_margin", "0"))))
+                state.best_price = max(Decimal("0"), Decimal(str(raw_trade.get("best_price", "0"))))
+                state.stop_price = max(Decimal("0"), Decimal(str(raw_trade.get("stop_price", "0"))))
+                state.stop_order_id = int(raw_trade["stop_order_id"]) if raw_trade.get("stop_order_id") else None
+                state.stop_client_id = raw_trade.get("stop_client_id") or None
+                state.stop_reason = str(raw_trade.get("stop_reason", "stop_loss"))
+                state.breakeven_done = bool(raw_trade.get("breakeven_done", False))
+                state.trailing_active = bool(raw_trade.get("trailing_active", False))
             logging.info("Restored daily stop counts for %s: %s", today, counts)
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             logging.warning("Could not load runtime state from %s: %s", self.state_path, exc)
@@ -1010,6 +1044,13 @@ class BnStraHighRisk1:
                 symbol: {
                     "opened_at_ms": state.opened_at_ms,
                     "initial_margin": format_decimal(state.initial_margin),
+                    "best_price": format_decimal(state.best_price),
+                    "stop_price": format_decimal(state.stop_price),
+                    "stop_order_id": state.stop_order_id,
+                    "stop_client_id": state.stop_client_id,
+                    "stop_reason": state.stop_reason,
+                    "breakeven_done": state.breakeven_done,
+                    "trailing_active": state.trailing_active,
                 }
                 for symbol, state in self.states.items()
                 if state.opened_at_ms > 0
@@ -1165,6 +1206,24 @@ def margin_roi(price: Decimal, entry: Decimal, side: str, leverage: int) -> Deci
     if side == "long":
         return (price / entry - Decimal("1")) * Decimal(leverage)
     return (entry / price - Decimal("1")) * Decimal(leverage) if price > 0 else Decimal("0")
+
+
+def trailing_callback_for_roi(
+    best_roi: Decimal,
+    activation_roi: Decimal,
+    activation_callback: Decimal,
+    tier_2_roi: Decimal,
+    tier_2_callback: Decimal,
+    tier_3_roi: Decimal,
+    tier_3_callback: Decimal,
+) -> Decimal | None:
+    if best_roi >= tier_3_roi:
+        return tier_3_callback
+    if best_roi >= tier_2_roi:
+        return tier_2_callback
+    if best_roi >= activation_roi:
+        return activation_callback
+    return None
 
 
 def improve_stop(current: Decimal, candidate: Decimal, side: str) -> Decimal:

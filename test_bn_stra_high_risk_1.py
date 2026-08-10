@@ -33,6 +33,7 @@ from bn_stra_high_risk_1 import (
     round_stop_price,
     strategy_signal,
     stop_improved_by,
+    trailing_callback_for_roi,
 )
 
 
@@ -44,6 +45,15 @@ class BnStraHighRisk1Tests(unittest.TestCase):
     def test_profit_trigger_price(self):
         self.assertEqual(profit_trigger_price(Decimal("100"), "long", Decimal("0.20"), 5), Decimal("104.00"))
         self.assertEqual(profit_trigger_price(Decimal("100"), "short", Decimal("0.20"), 5), Decimal("96.00"))
+
+    def test_trailing_callback_tightens_by_best_roi(self):
+        args = (
+            Decimal("0.25"), Decimal("0.04"), Decimal("0.50"), Decimal("0.03"), Decimal("0.80"), Decimal("0.02")
+        )
+        self.assertIsNone(trailing_callback_for_roi(Decimal("0.24"), *args))
+        self.assertEqual(trailing_callback_for_roi(Decimal("0.25"), *args), Decimal("0.04"))
+        self.assertEqual(trailing_callback_for_roi(Decimal("0.50"), *args), Decimal("0.03"))
+        self.assertEqual(trailing_callback_for_roi(Decimal("0.80"), *args), Decimal("0.02"))
 
     def test_breakeven_stop_price_includes_round_trip_fee_buffer(self):
         self.assertEqual(breakeven_stop_price(Decimal("100"), "long", Decimal("0.0004")), Decimal("100.0800"))
@@ -375,6 +385,10 @@ def test_config(dry_run=True, symbols=("ETHUSDT",), interval="5m"):
         fee_rate=Decimal("0.0004"),
         trailing_activation_roi=Decimal("0.20"),
         trailing_callback=Decimal("0.015"),
+        trailing_tier_2_roi=Decimal("0.50"),
+        trailing_tier_2_callback=Decimal("0.012"),
+        trailing_tier_3_roi=Decimal("0.80"),
+        trailing_tier_3_callback=Decimal("0.01"),
         pullback_entry_pct=Decimal("0"),
         pullback_confirm_pct=Decimal("0"),
         pullback_signal_wait_seconds=0,

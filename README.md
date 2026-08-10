@@ -68,10 +68,12 @@ The legacy `allocation_fraction` field is accepted for configuration compatibili
 Breakeven trigger = +12% margin ROI, approximately a 2.4% favorable price move
 Profit locked at trigger = +3% margin ROI, approximately a 0.6% favorable price move
 Trailing activation = +25% margin ROI, approximately a 5% favorable price move
-Trailing callback = 4% of price
+Trailing callback at +25% ROI = 4% of price
+Trailing callback at +50% ROI = 3% of price
+Trailing callback at +80% ROI = 2% of price
 ```
 
-At the first profit trigger, the bot moves the stop to the configured `profit_lock_roi` instead of nominal breakeven. With 5x leverage and `profit_lock_roi=0.03`, the stop is placed approximately 0.6% beyond entry. This buffer is intended to absorb taker fees and moderate stop-market slippage, but unusually thin order books can still produce a loss. Trailing management starts only after the separate trailing activation threshold is reached.
+At the first profit trigger, the bot moves the stop to the configured `profit_lock_roi` instead of nominal breakeven. With 5x leverage and `profit_lock_roi=0.03`, the stop is placed approximately 0.6% beyond entry. This buffer is intended to absorb taker fees and moderate stop-market slippage, but unusually thin order books can still produce a loss. Trailing management starts only after the separate trailing activation threshold is reached. Its callback tightens as the best margin ROI reaches each tier, and a reached tier never loosens the current stop.
 
 Position size is reduced as volatility rises: ATR up to 3% uses full size, 3%-4% uses 70%, and 4%-6% uses 40%. Above 6% no new position is opened. Managed trailing stops are replaced only when the stop improves by at least 0.2%.
 
