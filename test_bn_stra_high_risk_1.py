@@ -187,7 +187,7 @@ class BnStraHighRisk1Tests(unittest.TestCase):
 
         self.assertEqual(position["positionAmt"], "0")
 
-    def test_margin_is_split_by_symbol_count(self):
+    def test_margin_per_trade_is_fixed(self):
         config = test_config(False, symbols=("BTCUSDT", "SOLUSDT", "ETHUSDT"))
         bot = BnStraHighRisk1(config, FakeClient([]))
 

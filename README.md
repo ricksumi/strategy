@@ -8,7 +8,7 @@ The example configuration defaults to `dry_run: true` and does not place real or
 
 This strategy can lose money quickly. It uses leverage, market orders, conditional stop orders, and dynamic stop replacement. Network latency, API errors, slippage, funding fees, liquidation rules, exchange outages, and symbol-specific trading limits can materially change results.
 
-The configured base margin is `200 USDT` per new position. ATR risk scaling may reduce the actual margin below that amount when a wider volatility stop is required. Do not run it with funds you cannot afford to lose.
+The configured margin is `200 USDT` per new position. ATR affects entry eligibility and stop distance, but never reduces the configured margin. Do not run it with funds you cannot afford to lose.
 
 ## Default symbols
 
@@ -63,12 +63,14 @@ When the signal window expires, the bot starts a new window from the latest qual
 Base margin per position = configured margin_per_trade (default 200 USDT)
 Leverage = 5x
 Initial stop distance = max(2% of price, 1.5 * ATR percentage)
-Position size is reduced when the ATR stop exceeds 2%, keeping planned USDT risk approximately unchanged
+ATR never changes margin or order quantity
 ```
 
 At full size, `200 USDT` of margin with 5x leverage controls approximately `1,000 USDT` of notional exposure.
 
-The legacy `allocation_fraction` field is accepted for configuration compatibility but does not control live position margin. Before an order is placed, the bot checks Binance `availableBalance`. If it cannot cover the scaled margin plus an opening-fee allowance, the order is skipped and a rate-limited Hermes notification is queued.
+The legacy `allocation_fraction` field is accepted for configuration compatibility but does not control live position margin. Before an order is placed, the bot checks Binance `availableBalance`. If it cannot cover the configured margin plus an opening-fee allowance, the order is skipped and a rate-limited Hermes notification is queued.
+
+A wider ATR stop increases the planned USDT loss because margin remains fixed. For example, a `200 USDT` margin position at 5x leverage with a 5% price stop risks approximately `50 USDT` before fees and slippage.
 
 ## Exit management
 
@@ -86,7 +88,7 @@ Trailing callback at +60% ROI = 1% of price
 
 At the first profit trigger, the bot moves the stop to the configured `profit_lock_roi` instead of nominal breakeven. With 5x leverage and `profit_lock_roi=0.03`, the stop is placed approximately 0.6% beyond entry. This buffer is intended to absorb taker fees and moderate stop-market slippage, but unusually thin order books can still produce a loss. Trailing management starts only after the separate trailing activation threshold is reached. Its callback tightens as the best margin ROI reaches each tier, and a reached tier never loosens the current stop.
 
-Position size is reduced as volatility rises: ATR up to 3% uses full size, 3%-4% uses 70%, and 4%-6% uses 40%. Above 6% no new position is opened. Managed trailing stops are replaced only when the stop improves by at least 0.2%.
+ATR above 6% blocks new entries; ATR within the allowed range does not change position size. Managed trailing stops are replaced only when the stop improves by at least 0.2%.
 
 ## Risk controls
 

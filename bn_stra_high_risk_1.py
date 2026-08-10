@@ -451,34 +451,25 @@ class BnStraHighRisk1:
         confirm_pct = dynamic_confirm_pct(self.config.pullback_confirm_pct, atr_pct, self.config.atr_confirm_factor)
         if not self.pullback_entry_ready(state, signal, candles[-1].close, confirm_pct):
             return
-        size_factor = atr_size_factor(
-            atr_pct,
-            self.config.atr_full_size_max_pct,
-            self.config.atr_reduced_size_max_pct,
-            self.config.atr_reduced_size_factor,
-            self.config.atr_high_size_factor,
-        )
         base_stop_pct = self.config.stop_loss_roi / Decimal(self.config.leverage)
         stop_distance_pct = max(base_stop_pct, atr_pct * self.config.atr_stop_multiplier)
-        risk_size_factor = base_stop_pct / stop_distance_pct
-        self.open_position(symbol, signal, size_factor * risk_size_factor, stop_distance_pct)
+        self.open_position(symbol, signal, stop_distance_pct)
 
     def open_position(
         self,
         symbol: str,
         side: str,
-        size_factor: Decimal = Decimal("1"),
         stop_distance_pct: Decimal | None = None,
     ) -> None:
         equity, available_balance = self.get_usdt_account_balances()
-        margin = self.config.margin_per_trade * size_factor
+        margin = self.config.margin_per_trade
         required_available = margin * (Decimal("1") + self.config.fee_rate * Decimal(self.config.leverage))
         if available_balance < required_available:
             state = self.states[symbol]
             now = time.time()
             logging.warning(
-                "%s insufficient margin side=%s required=%s available=%s base_margin=%s size_factor=%s",
-                symbol, side, required_available, available_balance, self.config.margin_per_trade, size_factor,
+                "%s insufficient margin side=%s required=%s available=%s configured_margin=%s",
+                symbol, side, required_available, available_balance, margin,
             )
             if now - state.last_insufficient_margin_notice >= self.config.insufficient_margin_notice_cooldown_seconds:
                 self.notifier.send(
@@ -487,8 +478,7 @@ class BnStraHighRisk1:
                             f"[INSUFFICIENT MARGIN] {symbol} {side.upper()}",
                             f"Required available balance: {required_available:.4f} USDT",
                             f"Available balance: {available_balance:.4f} USDT",
-                            f"Configured base margin: {self.config.margin_per_trade:.4f} USDT",
-                            f"Risk size factor: {size_factor:.4f}",
+                            f"Configured margin: {margin:.4f} USDT",
                             "Order was not placed.",
                         ]
                     )
@@ -505,8 +495,8 @@ class BnStraHighRisk1:
         order_side = "BUY" if side == "long" else "SELL"
         stop_distance_pct = stop_distance_pct or self.config.stop_loss_roi / Decimal(self.config.leverage)
         logging.info(
-            "%s opening %s qty=%s margin=%s size_factor=%s stop_distance_pct=%s mark=%s",
-            symbol, side, qty, margin, size_factor, stop_distance_pct, mark_price,
+            "%s opening %s qty=%s margin=%s stop_distance_pct=%s mark=%s",
+            symbol, side, qty, margin, stop_distance_pct, mark_price,
         )
         order = self.place_market_order(symbol, order_side, qty)
         entry_price = Decimal(str(order.get("avgPrice", "0"))) if order else mark_price
