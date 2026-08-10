@@ -371,6 +371,7 @@ def test_config(dry_run=True, symbols=("ETHUSDT",), interval="5m"):
         allocation_fraction=Decimal("0.2"),
         stop_loss_roi=Decimal("0.10"),
         breakeven_roi=Decimal("0.10"),
+        profit_lock_roi=Decimal("0.03"),
         fee_rate=Decimal("0.0004"),
         trailing_activation_roi=Decimal("0.20"),
         trailing_callback=Decimal("0.015"),

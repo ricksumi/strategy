@@ -39,6 +39,7 @@ class BotConfig:
     allocation_fraction: Decimal
     stop_loss_roi: Decimal
     breakeven_roi: Decimal
+    profit_lock_roi: Decimal
     fee_rate: Decimal
     trailing_activation_roi: Decimal
     trailing_callback: Decimal
@@ -89,6 +90,7 @@ class BotConfig:
             allocation_fraction=Decimal(str(raw.get("allocation_fraction", "0.2"))),
             stop_loss_roi=Decimal(str(raw.get("stop_loss_roi", "0.10"))),
             breakeven_roi=Decimal(str(raw.get("breakeven_roi", "0.10"))),
+            profit_lock_roi=Decimal(str(raw.get("profit_lock_roi", "0"))),
             fee_rate=Decimal(str(raw.get("fee_rate", "0.0004"))),
             trailing_activation_roi=Decimal(str(raw.get("trailing_activation_roi", "0.20"))),
             trailing_callback=Decimal(str(raw.get("trailing_callback", "0.015"))),
@@ -143,6 +145,8 @@ class BotConfig:
             raise ValueError("ema_fast must be lower than ema_slow")
         if self.fee_rate < 0:
             raise ValueError("fee_rate cannot be negative")
+        if self.profit_lock_roi < 0 or self.profit_lock_roi >= self.breakeven_roi:
+            raise ValueError("profit_lock_roi must be non-negative and lower than breakeven_roi")
         if self.pullback_entry_pct < 0:
             raise ValueError("pullback_entry_pct cannot be negative")
         if self.pullback_confirm_pct < 0:
@@ -483,8 +487,11 @@ class BnStraHighRisk1:
 
         if reached_profit_trigger(mark_price, state.side, breakeven_trigger):
             state.breakeven_done = True
-            new_stop = improve_stop(new_stop, breakeven_stop_price(state.entry_price, state.side, self.config.fee_rate), state.side)
-            move_reasons.append("break_even_fee_buffer")
+            profit_lock_stop = profit_trigger_price(
+                state.entry_price, state.side, self.config.profit_lock_roi, self.config.leverage
+            )
+            new_stop = improve_stop(new_stop, profit_lock_stop, state.side)
+            move_reasons.append("profit_lock")
 
         if reached_profit_trigger(mark_price, state.side, trailing_trigger):
             state.trailing_active = True
@@ -598,7 +605,8 @@ class BnStraHighRisk1:
                     f"Margin: {state.initial_margin:.4f} USDT",
                     f"Notional: {(state.entry_price * state.quantity):.4f} USDT",
                     f"Initial stop: {format_decimal(state.stop_price)}",
-                    f"Breakeven trigger: {format_decimal(breakeven_trigger)} (+{self.config.breakeven_roi * 100}% ROI)",
+                    f"Profit-lock trigger: {format_decimal(breakeven_trigger)} (+{self.config.breakeven_roi * 100}% ROI)",
+                    f"Locked ROI after trigger: +{self.config.profit_lock_roi * 100}%",
                     f"Trailing trigger: {format_decimal(trailing_trigger)} (+{self.config.trailing_activation_roi * 100}% ROI)",
                 ]
             )
