@@ -47,6 +47,10 @@ class BotConfig:
     trailing_tier_2_callback: Decimal
     trailing_tier_3_roi: Decimal
     trailing_tier_3_callback: Decimal
+    partial_take_1_roi: Decimal
+    partial_take_1_fraction: Decimal
+    partial_take_2_roi: Decimal
+    partial_take_2_fraction: Decimal
     pullback_entry_pct: Decimal
     pullback_confirm_pct: Decimal
     pullback_signal_wait_seconds: int
@@ -102,6 +106,10 @@ class BotConfig:
             trailing_tier_2_callback=Decimal(str(raw.get("trailing_tier_2_callback", "0.03"))),
             trailing_tier_3_roi=Decimal(str(raw.get("trailing_tier_3_roi", "0.80"))),
             trailing_tier_3_callback=Decimal(str(raw.get("trailing_tier_3_callback", "0.02"))),
+            partial_take_1_roi=Decimal(str(raw.get("partial_take_1_roi", "0.25"))),
+            partial_take_1_fraction=Decimal(str(raw.get("partial_take_1_fraction", "0.25"))),
+            partial_take_2_roi=Decimal(str(raw.get("partial_take_2_roi", "0.40"))),
+            partial_take_2_fraction=Decimal(str(raw.get("partial_take_2_fraction", "0.25"))),
             pullback_entry_pct=Decimal(str(raw.get("pullback_entry_pct", "0"))),
             pullback_confirm_pct=Decimal(str(raw.get("pullback_confirm_pct", "0"))),
             pullback_signal_wait_seconds=int(raw.get("pullback_signal_wait_seconds", 0)),
@@ -159,6 +167,12 @@ class BotConfig:
             raise ValueError("trailing ROI tiers must be strictly increasing")
         if not (self.trailing_callback >= self.trailing_tier_2_callback >= self.trailing_tier_3_callback > 0):
             raise ValueError("trailing callbacks must be positive and non-increasing")
+        if not (0 < self.partial_take_1_roi < self.partial_take_2_roi):
+            raise ValueError("partial take-profit ROI tiers must be positive and increasing")
+        if not (0 < self.partial_take_1_fraction < 1 and 0 < self.partial_take_2_fraction < 1):
+            raise ValueError("partial take-profit fractions must be in (0, 1)")
+        if self.partial_take_1_fraction + self.partial_take_2_fraction >= 1:
+            raise ValueError("partial take-profit fractions must leave a trailing position")
         if self.pullback_entry_pct < 0:
             raise ValueError("pullback_entry_pct cannot be negative")
         if self.pullback_confirm_pct < 0:
@@ -229,6 +243,9 @@ class PositionState:
     daily_limit_logged: bool = False
     opened_at_ms: int = 0
     initial_margin: Decimal = Decimal("0")
+    initial_quantity: Decimal = Decimal("0")
+    partial_take_1_done: bool = False
+    partial_take_2_done: bool = False
 
 
 class HermesNotifier:
@@ -461,6 +478,9 @@ class BnStraHighRisk1:
         state.trailing_active = False
         state.opened_at_ms = int(time.time() * 1000)
         state.initial_margin = margin
+        state.initial_quantity = qty
+        state.partial_take_1_done = False
+        state.partial_take_2_done = False
         self.clear_pending_signal(state)
         self.save_runtime_state()
         logging.info(
@@ -486,6 +506,12 @@ class BnStraHighRisk1:
             state.best_price = max(state.best_price, mark_price)
         else:
             state.best_price = min(state.best_price, mark_price)
+
+        current_roi = margin_roi(mark_price, state.entry_price, state.side, self.config.leverage)
+        if current_roi >= self.config.partial_take_1_roi and not state.partial_take_1_done:
+            self.execute_partial_take_profit(state, 1, self.config.partial_take_1_fraction, mark_price)
+        if current_roi >= self.config.partial_take_2_roi and not state.partial_take_2_done:
+            self.execute_partial_take_profit(state, 2, self.config.partial_take_2_fraction, mark_price)
 
         new_stop = state.stop_price
         breakeven_trigger = profit_trigger_price(state.entry_price, state.side, self.config.breakeven_roi, self.config.leverage)
@@ -558,6 +584,59 @@ class BnStraHighRisk1:
                 state.stop_reason,
             )
 
+    def execute_partial_take_profit(
+        self, state: PositionState, tier: int, fraction: Decimal, mark_price: Decimal
+    ) -> None:
+        target_qty = round_to_step(state.initial_quantity * fraction, self.rules[state.symbol].step_size)
+        close_qty = min(state.quantity, target_qty)
+        if close_qty < self.rules[state.symbol].min_qty:
+            logging.warning("%s partial take-profit tier=%s quantity=%s below minQty", state.symbol, tier, close_qty)
+            return
+        params = {
+            "symbol": state.symbol,
+            "side": "SELL" if state.side == "long" else "BUY",
+            "type": "MARKET",
+            "quantity": format_decimal(close_qty),
+            "reduceOnly": "true",
+            "newOrderRespType": "RESULT",
+        }
+        if self.config.dry_run:
+            logging.info("[dry-run] partial take-profit %s", params)
+            order = {"avgPrice": str(mark_price)}
+        else:
+            order = self.client.signed_request("POST", "/fapi/v1/order", params)
+        fill_price = Decimal(str(order.get("avgPrice", "0"))) if order else Decimal("0")
+        state.quantity -= close_qty
+        state.partial_take_1_done = state.partial_take_1_done or tier == 1
+        state.partial_take_2_done = state.partial_take_2_done or tier == 2
+        if state.stop_order_id is not None:
+            self.cancel_stop_order(state.symbol, state.stop_order_id)
+        else:
+            self.cancel_algo_open_orders(state.symbol)
+        stop_order = self.place_stop_order(state.symbol, state.side or "long", state.quantity, state.stop_price, "managed")
+        state.stop_order_id = int(stop_order.get("algoId")) if stop_order and stop_order.get("algoId") else None
+        state.stop_client_id = stop_order.get("clientAlgoId") if stop_order else None
+        self.save_runtime_state()
+        realized_estimate = (fill_price - state.entry_price) * close_qty
+        if state.side == "short":
+            realized_estimate = (state.entry_price - fill_price) * close_qty
+        logging.info(
+            "%s partial take-profit tier=%s qty=%s fill=%s remaining=%s estimated_gross_pnl=%s",
+            state.symbol, tier, close_qty, fill_price, state.quantity, realized_estimate,
+        )
+        self.notifier.send(
+            "\n".join(
+                [
+                    f"[PARTIAL TAKE PROFIT] {state.symbol} {(state.side or 'unknown').upper()}",
+                    f"Tier: {tier}",
+                    f"Closed quantity: {format_decimal(close_qty)}",
+                    f"Fill price: {format_decimal(fill_price)}",
+                    f"Remaining quantity: {format_decimal(state.quantity)}",
+                    f"Estimated gross PnL: {realized_estimate:+.4f} USDT",
+                ]
+            )
+        )
+
     def replace_stop_order(self, state: PositionState, new_stop: Decimal) -> None:
         if state.stop_order_id is not None:
             self.cancel_stop_order(state.symbol, state.stop_order_id)
@@ -609,6 +688,9 @@ class BnStraHighRisk1:
         state.trailing_active = False
         state.opened_at_ms = 0
         state.initial_margin = Decimal("0")
+        state.initial_quantity = Decimal("0")
+        state.partial_take_1_done = False
+        state.partial_take_2_done = False
         state.cooldown_until = time.time() + self.config.cooldown_seconds
         self.save_runtime_state()
         logging.info("%s cooldown_until=%s", state.symbol, datetime.fromtimestamp(state.cooldown_until, self.tz).isoformat())
@@ -915,7 +997,11 @@ class BnStraHighRisk1:
                 state.opened_at_ms = int(time.time() * 1000)
             if state.initial_margin <= 0:
                 state.initial_margin = entry * abs(amt) / Decimal(self.config.leverage)
+            if state.initial_quantity <= 0:
+                state.initial_quantity = abs(amt)
             self.save_runtime_state()
+        else:
+            state.quantity = abs(amt)
 
     def place_market_order(self, symbol: str, side: str, quantity: Decimal) -> dict[str, Any]:
         params = {
@@ -1015,11 +1101,16 @@ class BnStraHighRisk1:
             if not isinstance(active_trades, dict):
                 raise ValueError("active_trades must be an object")
             for symbol, raw_trade in active_trades.items():
-                if symbol not in self.states or not isinstance(raw_trade, dict):
+                if not isinstance(raw_trade, dict):
                     continue
+                if symbol not in self.states:
+                    self.states[symbol] = PositionState(symbol=symbol)
                 state = self.states[symbol]
                 state.opened_at_ms = max(0, int(raw_trade.get("opened_at_ms", 0)))
                 state.initial_margin = max(Decimal("0"), Decimal(str(raw_trade.get("initial_margin", "0"))))
+                state.initial_quantity = max(Decimal("0"), Decimal(str(raw_trade.get("initial_quantity", "0"))))
+                state.partial_take_1_done = bool(raw_trade.get("partial_take_1_done", False))
+                state.partial_take_2_done = bool(raw_trade.get("partial_take_2_done", False))
                 state.best_price = max(Decimal("0"), Decimal(str(raw_trade.get("best_price", "0"))))
                 state.stop_price = max(Decimal("0"), Decimal(str(raw_trade.get("stop_price", "0"))))
                 state.stop_order_id = int(raw_trade["stop_order_id"]) if raw_trade.get("stop_order_id") else None
@@ -1044,6 +1135,9 @@ class BnStraHighRisk1:
                 symbol: {
                     "opened_at_ms": state.opened_at_ms,
                     "initial_margin": format_decimal(state.initial_margin),
+                    "initial_quantity": format_decimal(state.initial_quantity),
+                    "partial_take_1_done": state.partial_take_1_done,
+                    "partial_take_2_done": state.partial_take_2_done,
                     "best_price": format_decimal(state.best_price),
                     "stop_price": format_decimal(state.stop_price),
                     "stop_order_id": state.stop_order_id,

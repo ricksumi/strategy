@@ -338,6 +338,19 @@ class BnStraHighRisk1Tests(unittest.TestCase):
             self.assertEqual(bot.states["ETHUSDT"].opened_at_ms, 123456)
             self.assertEqual(bot.states["ETHUSDT"].initial_margin, Decimal("250.5"))
 
+    def test_active_trade_metadata_restores_non_entry_symbol(self):
+        with TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            state_file.write_text(
+                '{"day":"2000-01-01","daily_stop_counts":{},"active_trades":'
+                '{"OLDUSDT":{"opened_at_ms":123456,"initial_margin":"100"}}}\n',
+                encoding="utf-8",
+            )
+            with patch.dict("os.environ", {"BN_STRA_STATE_FILE": str(state_file)}):
+                bot = BnStraHighRisk1(test_config(False), FakeClient([]))
+
+            self.assertEqual(bot.states["OLDUSDT"].opened_at_ms, 123456)
+
 
 class FakeClient(BinanceClient):
     def __init__(self, position_response):
@@ -389,6 +402,10 @@ def test_config(dry_run=True, symbols=("ETHUSDT",), interval="5m"):
         trailing_tier_2_callback=Decimal("0.012"),
         trailing_tier_3_roi=Decimal("0.80"),
         trailing_tier_3_callback=Decimal("0.01"),
+        partial_take_1_roi=Decimal("0.25"),
+        partial_take_1_fraction=Decimal("0.25"),
+        partial_take_2_roi=Decimal("0.40"),
+        partial_take_2_fraction=Decimal("0.25"),
         pullback_entry_pct=Decimal("0"),
         pullback_confirm_pct=Decimal("0"),
         pullback_signal_wait_seconds=0,
