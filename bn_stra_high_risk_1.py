@@ -54,6 +54,13 @@ class BotConfig:
     atr_reduced_size_max_pct: Decimal
     atr_reduced_size_factor: Decimal
     atr_high_size_factor: Decimal
+    atr_confirm_factor: Decimal
+    max_ema_atr_distance: Decimal
+    contract_position_filter: bool
+    crowded_short_global_max: Decimal
+    crowded_short_top_min: Decimal
+    crowded_long_global_min: Decimal
+    crowded_long_top_max: Decimal
     stop_update_min_pct: Decimal
     daily_stop_limit: int
     cooldown_seconds: int
@@ -94,6 +101,13 @@ class BotConfig:
             atr_reduced_size_max_pct=Decimal(str(raw.get("atr_reduced_size_max_pct", "0.04"))),
             atr_reduced_size_factor=Decimal(str(raw.get("atr_reduced_size_factor", "0.70"))),
             atr_high_size_factor=Decimal(str(raw.get("atr_high_size_factor", "0.40"))),
+            atr_confirm_factor=Decimal(str(raw.get("atr_confirm_factor", "0.15"))),
+            max_ema_atr_distance=Decimal(str(raw.get("max_ema_atr_distance", "1.5"))),
+            contract_position_filter=bool(raw.get("contract_position_filter", True)),
+            crowded_short_global_max=Decimal(str(raw.get("crowded_short_global_max", "0.65"))),
+            crowded_short_top_min=Decimal(str(raw.get("crowded_short_top_min", "1.20"))),
+            crowded_long_global_min=Decimal(str(raw.get("crowded_long_global_min", "1.55"))),
+            crowded_long_top_max=Decimal(str(raw.get("crowded_long_top_max", "0.83"))),
             stop_update_min_pct=Decimal(str(raw.get("stop_update_min_pct", "0.002"))),
             daily_stop_limit=int(raw.get("daily_stop_limit", 3)),
             cooldown_seconds=int(raw.get("cooldown_seconds", 600)),
@@ -137,6 +151,8 @@ class BotConfig:
             raise ValueError("ATR sizing thresholds must be ordered and no greater than atr_max_pct")
         if not (0 < self.atr_reduced_size_factor <= 1 and 0 < self.atr_high_size_factor <= 1):
             raise ValueError("ATR size factors must be in (0, 1]")
+        if self.atr_confirm_factor < 0 or self.max_ema_atr_distance <= 0:
+            raise ValueError("ATR confirmation factor must be non-negative and EMA distance must be positive")
         if self.stop_update_min_pct < 0:
             raise ValueError("stop_update_min_pct cannot be negative")
         if self.working_type not in {"MARK_PRICE", "CONTRACT_PRICE"}:
@@ -178,11 +194,13 @@ class PositionState:
     pending_signal_side: str | None = None
     pending_signal_price: Decimal = Decimal("0")
     pending_signal_until: float = 0
+    pending_confirm_pct: Decimal = Decimal("0")
     pending_pullback_reached: bool = False
     pending_pullback_extreme: Decimal = Decimal("0")
     cooldown_until: float = 0
     daily_stop_day: str = ""
     daily_stop_count: int = 0
+    daily_limit_logged: bool = False
 
 
 class BinanceClient:
@@ -281,7 +299,9 @@ class BnStraHighRisk1:
             return
 
         if state.daily_stop_count >= self.config.daily_stop_limit:
-            logging.info("%s daily stop limit reached: %s", symbol, state.daily_stop_count)
+            if not state.daily_limit_logged:
+                logging.info("%s daily stop limit reached: %s", symbol, state.daily_stop_count)
+                state.daily_limit_logged = True
             return
         if time.time() < state.cooldown_until:
             return
@@ -300,9 +320,34 @@ class BnStraHighRisk1:
         if signal == "none":
             self.clear_pending_signal(state)
             return
-        if not self.pullback_entry_ready(state, signal, candles[-1].close):
-            return
         atr_pct = atr_percent(candles, self.config.atr_period)
+        if not entry_near_ema(candles, self.config.ema_fast, atr_pct, self.config.max_ema_atr_distance):
+            logging.info("%s signal=%s blocked: price too far from EMA%s", symbol, signal, self.config.ema_fast)
+            self.clear_pending_signal(state)
+            return
+        if self.config.contract_position_filter:
+            global_ratio, top_ratio = self.get_contract_position_ratios(symbol)
+            if not contract_position_allows(
+                signal,
+                global_ratio,
+                top_ratio,
+                self.config.crowded_short_global_max,
+                self.config.crowded_short_top_min,
+                self.config.crowded_long_global_min,
+                self.config.crowded_long_top_max,
+            ):
+                logging.info(
+                    "%s signal=%s blocked: contract positioning global_ls=%s top_position_ls=%s",
+                    symbol,
+                    signal,
+                    global_ratio,
+                    top_ratio,
+                )
+                self.clear_pending_signal(state)
+                return
+        confirm_pct = dynamic_confirm_pct(self.config.pullback_confirm_pct, atr_pct, self.config.atr_confirm_factor)
+        if not self.pullback_entry_ready(state, signal, candles[-1].close, confirm_pct):
+            return
         size_factor = atr_size_factor(
             atr_pct,
             self.config.atr_full_size_max_pct,
@@ -475,15 +520,19 @@ class BnStraHighRisk1:
         state.cooldown_until = time.time() + self.config.cooldown_seconds
         logging.info("%s cooldown_until=%s", state.symbol, datetime.fromtimestamp(state.cooldown_until, self.tz).isoformat())
 
-    def pullback_entry_ready(self, state: PositionState, side: str, signal_price: Decimal) -> bool:
+    def pullback_entry_ready(
+        self, state: PositionState, side: str, signal_price: Decimal, confirm_pct: Decimal | None = None
+    ) -> bool:
         if self.config.pullback_entry_pct <= 0:
             return True
 
+        confirm_pct = self.config.pullback_confirm_pct if confirm_pct is None else confirm_pct
         now = time.time()
         if state.pending_signal_side != side or now >= state.pending_signal_until:
             state.pending_signal_side = side
             state.pending_signal_price = signal_price
             state.pending_signal_until = now + self.config.pullback_signal_wait_seconds
+            state.pending_confirm_pct = confirm_pct
             state.pending_pullback_reached = False
             state.pending_pullback_extreme = Decimal("0")
             target = pullback_target_price(signal_price, side, self.config.pullback_entry_pct)
@@ -493,7 +542,7 @@ class BnStraHighRisk1:
                 side,
                 signal_price,
                 target,
-                self.config.pullback_confirm_pct,
+                state.pending_confirm_pct,
                 datetime.fromtimestamp(state.pending_signal_until, self.tz).isoformat(),
             )
 
@@ -519,9 +568,9 @@ class BnStraHighRisk1:
                 mark_price,
                 state.pending_signal_price,
                 target,
-                self.config.pullback_confirm_pct,
+                state.pending_confirm_pct,
             )
-            if self.config.pullback_confirm_pct <= 0:
+            if state.pending_confirm_pct <= 0:
                 return True
             return False
 
@@ -529,8 +578,8 @@ class BnStraHighRisk1:
             state.pending_pullback_extreme = min(state.pending_pullback_extreme, mark_price)
         else:
             state.pending_pullback_extreme = max(state.pending_pullback_extreme, mark_price)
-        confirmation = pullback_confirmation_price(state.pending_pullback_extreme, side, self.config.pullback_confirm_pct)
-        if pullback_reversal_confirmed(mark_price, side, state.pending_pullback_extreme, self.config.pullback_confirm_pct):
+        confirmation = pullback_confirmation_price(state.pending_pullback_extreme, side, state.pending_confirm_pct)
+        if pullback_reversal_confirmed(mark_price, side, state.pending_pullback_extreme, state.pending_confirm_pct):
             logging.info(
                 "%s pullback reversal confirmed side=%s mark=%s extreme=%s confirmation=%s signal_price=%s target=%s",
                 state.symbol,
@@ -558,6 +607,7 @@ class BnStraHighRisk1:
         state.pending_signal_side = None
         state.pending_signal_price = Decimal("0")
         state.pending_signal_until = 0
+        state.pending_confirm_pct = Decimal("0")
         state.pending_pullback_reached = False
         state.pending_pullback_extreme = Decimal("0")
 
@@ -649,6 +699,14 @@ class BnStraHighRisk1:
     def get_mark_price(self, symbol: str) -> Decimal:
         data = self.client.public_request("GET", "/fapi/v1/premiumIndex", {"symbol": symbol})
         return Decimal(data["markPrice"])
+
+    def get_contract_position_ratios(self, symbol: str) -> tuple[Decimal, Decimal]:
+        params = {"symbol": symbol, "period": self.config.interval, "limit": 1}
+        global_rows = self.client.public_request("GET", "/futures/data/globalLongShortAccountRatio", params)
+        top_rows = self.client.public_request("GET", "/futures/data/topLongShortPositionRatio", params)
+        if not global_rows or not top_rows:
+            raise RuntimeError(f"No contract positioning data returned for {symbol}")
+        return Decimal(global_rows[-1]["longShortRatio"]), Decimal(top_rows[-1]["longShortRatio"])
 
     def get_total_usdt_equity(self) -> Decimal:
         if self.config.dry_run:
@@ -766,6 +824,7 @@ class BnStraHighRisk1:
         if state.daily_stop_day != today:
             state.daily_stop_day = today
             state.daily_stop_count = 0
+            state.daily_limit_logged = False
             self.save_runtime_state()
 
     def load_runtime_state(self) -> None:
@@ -978,6 +1037,41 @@ def atr_size_factor(
     if atr_pct <= reduced_size_max_pct:
         return reduced_size_factor
     return high_size_factor
+
+
+def dynamic_confirm_pct(base_pct: Decimal, atr_pct: Decimal | None, atr_factor: Decimal) -> Decimal:
+    if atr_pct is None:
+        return base_pct
+    return max(base_pct, atr_pct * atr_factor)
+
+
+def entry_near_ema(
+    candles: list[Candle], ema_period: int, atr_pct: Decimal | None, max_atr_distance: Decimal
+) -> bool:
+    if not candles or atr_pct is None or atr_pct <= 0:
+        return False
+    ema = ema_values([c.close for c in candles], ema_period)[-1]
+    close = candles[-1].close
+    if ema is None or close <= 0:
+        return False
+    atr_value = atr_pct * close
+    return abs(close - ema) <= atr_value * max_atr_distance
+
+
+def contract_position_allows(
+    side: str,
+    global_ratio: Decimal,
+    top_ratio: Decimal,
+    crowded_short_global_max: Decimal,
+    crowded_short_top_min: Decimal,
+    crowded_long_global_min: Decimal,
+    crowded_long_top_max: Decimal,
+) -> bool:
+    if side == "short" and global_ratio <= crowded_short_global_max and top_ratio >= crowded_short_top_min:
+        return False
+    if side == "long" and global_ratio >= crowded_long_global_min and top_ratio <= crowded_long_top_max:
+        return False
+    return True
 
 
 def round_stop_price(price: Decimal, tick_size: Decimal, side: str) -> Decimal:

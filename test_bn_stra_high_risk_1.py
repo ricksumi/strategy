@@ -20,6 +20,9 @@ from bn_stra_high_risk_1 import (
     improve_stop,
     initial_stop_price,
     client_order_id,
+    contract_position_allows,
+    dynamic_confirm_pct,
+    entry_near_ema,
     load_env_file,
     margin_roi,
     pullback_confirmation_price,
@@ -69,6 +72,26 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         self.assertEqual(atr_size_factor(Decimal("0.03"), *args), Decimal("1"))
         self.assertEqual(atr_size_factor(Decimal("0.035"), *args), Decimal("0.70"))
         self.assertEqual(atr_size_factor(Decimal("0.05"), *args), Decimal("0.40"))
+
+    def test_dynamic_confirmation_uses_larger_atr_threshold(self):
+        self.assertEqual(dynamic_confirm_pct(Decimal("0.004"), Decimal("0.02"), Decimal("0.15")), Decimal("0.004"))
+        self.assertEqual(dynamic_confirm_pct(Decimal("0.004"), Decimal("0.05"), Decimal("0.15")), Decimal("0.0075"))
+
+    def test_contract_position_filter_blocks_squeeze_risk(self):
+        args = (Decimal("0.65"), Decimal("1.20"), Decimal("1.55"), Decimal("0.83"))
+        self.assertFalse(contract_position_allows("short", Decimal("0.60"), Decimal("1.40"), *args))
+        self.assertFalse(contract_position_allows("long", Decimal("1.60"), Decimal("0.80"), *args))
+        self.assertTrue(contract_position_allows("long", Decimal("0.60"), Decimal("1.40"), *args))
+        self.assertTrue(contract_position_allows("short", Decimal("1.60"), Decimal("0.80"), *args))
+
+    def test_entry_distance_from_ema_is_limited_by_atr(self):
+        candles = [
+            Candle(i, Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), i)
+            for i in range(20)
+        ]
+        candles[-1] = Candle(19, Decimal("100"), Decimal("103"), Decimal("99"), Decimal("102"), 19)
+        self.assertTrue(entry_near_ema(candles, 20, Decimal("0.02"), Decimal("1.5")))
+        self.assertFalse(entry_near_ema(candles, 20, Decimal("0.005"), Decimal("1.5")))
 
     def test_pullback_entry_price(self):
         self.assertEqual(pullback_target_price(Decimal("100"), "long", Decimal("0.004")), Decimal("99.600"))
@@ -348,6 +371,13 @@ def test_config(dry_run=True, symbols=("ETHUSDT",), interval="5m"):
         atr_reduced_size_max_pct=Decimal("0"),
         atr_reduced_size_factor=Decimal("0.70"),
         atr_high_size_factor=Decimal("0.40"),
+        atr_confirm_factor=Decimal("0.15"),
+        max_ema_atr_distance=Decimal("1.5"),
+        contract_position_filter=True,
+        crowded_short_global_max=Decimal("0.65"),
+        crowded_short_top_min=Decimal("1.20"),
+        crowded_long_global_min=Decimal("1.55"),
+        crowded_long_top_max=Decimal("0.83"),
         stop_update_min_pct=Decimal("0.002"),
         daily_stop_limit=3,
         cooldown_seconds=600,

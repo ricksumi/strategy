@@ -29,7 +29,10 @@ EMA20 < EMA60: short only
 ADX14 > 30: entry allowed
 0.5% <= ATR14 / close <= 6%: entry allowed
 Otherwise: no entry
+Price distance from EMA20 must not exceed 1.5 ATR
 ```
+
+The bot also rejects a short when the global account long/short ratio is at or below `0.65` while the top-trader position ratio is at or above `1.20`. The inverse crowded-long condition rejects longs when the global ratio is at or above `1.55` and the top-trader ratio is at or below `0.83`.
 
 ## Entry flow
 
@@ -38,8 +41,8 @@ The bot does not immediately chase a trend signal.
 ```text
 Long pullback: current price <= signal close * 0.996
 Short pullback: current price >= signal close * 1.004
-Long confirmation: price rebounds 0.4% from the pullback low
-Short confirmation: price falls 0.4% from the pullback high
+Long confirmation: price rebounds by max(0.4%, ATR percentage * 0.15) from the pullback low
+Short confirmation: price falls by max(0.4%, ATR percentage * 0.15) from the pullback high
 Signal window: 300 seconds
 Order type after confirmation: MARKET
 ```
@@ -188,4 +191,5 @@ test_bn_stra_high_risk_1.py    Unit tests
 - Restarting while positions are open can lose in-memory stop-management state. Prefer restarting only when the account is flat.
 - Daily initial-stop counts are persisted in `.bn-stra-high-risk-1-state.json` and restored after a restart.
 - Existing account positions outside the configured entry symbols remain monitored until they close; the bot will not reopen them.
+- The daily stop-limit message is logged once per symbol per day instead of once per polling cycle.
 - Always verify the protective stop after a live entry.
