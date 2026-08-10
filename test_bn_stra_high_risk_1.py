@@ -178,14 +178,17 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         self.assertEqual(bot.margin_per_symbol(Decimal("1500")), Decimal("500"))
 
     def test_non_entry_managed_symbol_does_not_open_after_close(self):
-        bot = BnStraHighRisk1(test_config(False), FakeClient([]))
-        bot.states["OLDUSDT"] = PositionState(symbol="OLDUSDT")
-        bot.managed_symbols.append("OLDUSDT")
+        with TemporaryDirectory() as tmpdir, patch.dict(
+            "os.environ", {"BN_STRA_STATE_FILE": str(Path(tmpdir) / "state.json")}
+        ):
+            bot = BnStraHighRisk1(test_config(False), FakeClient([]))
+            bot.states["OLDUSDT"] = PositionState(symbol="OLDUSDT")
+            bot.managed_symbols.append("OLDUSDT")
 
-        with patch.object(bot, "get_position", return_value={"positionAmt": "0"}), patch.object(
-            bot, "fetch_candles"
-        ) as fetch_candles:
-            bot.tick_symbol("OLDUSDT")
+            with patch.object(bot, "get_position", return_value={"positionAmt": "0"}), patch.object(
+                bot, "fetch_candles"
+            ) as fetch_candles:
+                bot.tick_symbol("OLDUSDT")
 
         fetch_candles.assert_not_called()
 
