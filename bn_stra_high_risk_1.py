@@ -1198,6 +1198,15 @@ class BnStraHighRisk1:
                 raise ValueError("daily_stop_counts must be an object")
             for symbol, state in self.states.items():
                 state.daily_stop_count = max(0, int(counts.get(symbol, 0)))
+            cooldowns = data.get("cooldown_until", {})
+            if not isinstance(cooldowns, dict):
+                raise ValueError("cooldown_until must be an object")
+            now = time.time()
+            for symbol, value in cooldowns.items():
+                if symbol not in self.states:
+                    self.states[symbol] = PositionState(symbol=symbol)
+                restored_until = float(value)
+                self.states[symbol].cooldown_until = restored_until if restored_until > now else 0
             active_trades = data.get("active_trades", {})
             if not isinstance(active_trades, dict):
                 raise ValueError("active_trades must be an object")
@@ -1231,6 +1240,11 @@ class BnStraHighRisk1:
                 symbol: state.daily_stop_count
                 for symbol, state in self.states.items()
                 if state.daily_stop_day == today and state.daily_stop_count > 0
+            },
+            "cooldown_until": {
+                symbol: state.cooldown_until
+                for symbol, state in self.states.items()
+                if state.cooldown_until > time.time()
             },
             "active_trades": {
                 symbol: {

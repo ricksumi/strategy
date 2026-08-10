@@ -406,6 +406,19 @@ class BnStraHighRisk1Tests(unittest.TestCase):
 
             self.assertEqual(restarted.states["ETHUSDT"].daily_stop_count, 2)
 
+    def test_cooldown_survives_restart(self):
+        with TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            with patch.dict("os.environ", {"BN_STRA_STATE_FILE": str(state_file)}), patch(
+                "bn_stra_high_risk_1.time.time", return_value=1000
+            ):
+                first = BnStraHighRisk1(test_config(False), FakeClient([]))
+                first.states["ETHUSDT"].cooldown_until = 1600
+                first.save_runtime_state()
+                restarted = BnStraHighRisk1(test_config(False), FakeClient([]))
+
+            self.assertEqual(restarted.states["ETHUSDT"].cooldown_until, 1600)
+
     def test_stale_daily_stop_counts_are_ignored(self):
         with TemporaryDirectory() as tmpdir:
             state_file = Path(tmpdir) / "state.json"
