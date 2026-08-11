@@ -492,10 +492,10 @@ class BnStraHighRisk1:
                     "\n".join(
                         [
                             f"[INSUFFICIENT MARGIN] {symbol} {side.upper()}",
-                            f"Required available balance: {required_available:.4f} USDT",
-                            f"Available balance: {available_balance:.4f} USDT",
-                            f"Configured margin: {margin:.4f} USDT",
-                            "Order was not placed.",
+                            f"- Required available balance: {required_available:.4f} USDT",
+                            f"- Available balance: {available_balance:.4f} USDT",
+                            f"- Configured margin: {margin:.4f} USDT",
+                            "- Order was not placed.",
                         ]
                     )
                 )
@@ -689,11 +689,11 @@ class BnStraHighRisk1:
             "\n".join(
                 [
                     f"[PARTIAL TAKE PROFIT] {state.symbol} {(state.side or 'unknown').upper()}",
-                    f"Tier: {tier}",
-                    f"Closed quantity: {format_decimal(close_qty)}",
-                    f"Fill price: {format_decimal(fill_price)}",
-                    f"Remaining quantity: {format_decimal(state.quantity)}",
-                    f"Estimated gross PnL: {realized_estimate:+.4f} USDT",
+                    f"- Tier: {tier}",
+                    f"- Closed quantity: {format_decimal(close_qty)}",
+                    f"- Fill price: {format_decimal(fill_price)}",
+                    f"- Remaining quantity: {format_decimal(state.quantity)}",
+                    f"- Estimated gross PnL: {realized_estimate:+.4f} USDT",
                 ]
             )
         )
@@ -803,14 +803,14 @@ class BnStraHighRisk1:
             "\n".join(
                 [
                     f"[OPEN] {state.symbol} {state.side.upper()} {self.config.leverage}x",
-                    f"Entry: {format_decimal(state.entry_price)}",
-                    f"Quantity: {format_decimal(state.quantity)}",
-                    f"Margin: {state.initial_margin:.4f} USDT",
-                    f"Notional: {(state.entry_price * state.quantity):.4f} USDT",
-                    f"Initial stop: {format_decimal(state.stop_price)}",
-                    f"Profit-lock trigger: {format_decimal(breakeven_trigger)} (+{self.config.breakeven_roi * 100}% ROI)",
-                    f"Locked ROI after trigger: +{self.config.profit_lock_roi * 100}%",
-                    f"Trailing trigger: {format_decimal(trailing_trigger)} (+{self.config.trailing_activation_roi * 100}% ROI)",
+                    f"- Entry: {format_decimal(state.entry_price)}",
+                    f"- Quantity: {format_decimal(state.quantity)}",
+                    f"- Margin: {state.initial_margin:.4f} USDT",
+                    f"- Notional: {(state.entry_price * state.quantity):.4f} USDT",
+                    f"- Initial stop: {format_decimal(state.stop_price)}",
+                    f"- Profit-lock trigger: {format_decimal(breakeven_trigger)} (+{self.config.breakeven_roi * 100}% ROI)",
+                    f"- Locked ROI after trigger: +{self.config.profit_lock_roi * 100}%",
+                    f"- Trailing trigger: {format_decimal(trailing_trigger)} (+{self.config.trailing_activation_roi * 100}% ROI)",
                 ]
             )
         )
@@ -849,15 +849,15 @@ class BnStraHighRisk1:
             "\n".join(
                 [
                     f"[CLOSED] {state.symbol} {(state.side or 'unknown').upper()}",
-                    f"Reason: {state.stop_reason}",
-                    f"Entry: {format_decimal(state.entry_price)}",
-                    f"Quantity: {format_decimal(state.quantity)}",
-                    f"Realized PnL: {realized:+.4f} USDT" if complete else "Realized PnL: unavailable",
-                    f"Commission: {commission:+.4f} USDT" if complete else "Commission: unavailable",
-                    f"Funding: {funding:+.4f} USDT" if complete else "Funding: unavailable",
-                    f"Net PnL: {pnl_label}",
-                    f"Margin ROI: {roi_label}",
-                    f"Duration: {duration // 3600}h {(duration % 3600) // 60}m {duration % 60}s",
+                    f"- Reason: {state.stop_reason}",
+                    f"- Entry: {format_decimal(state.entry_price)}",
+                    f"- Quantity: {format_decimal(state.quantity)}",
+                    f"- Realized PnL: {realized:+.4f} USDT" if complete else "- Realized PnL: unavailable",
+                    f"- Commission: {commission:+.4f} USDT" if complete else "- Commission: unavailable",
+                    f"- Funding: {funding:+.4f} USDT" if complete else "- Funding: unavailable",
+                    f"- Net PnL: {pnl_label}",
+                    f"- Margin ROI: {roi_label}",
+                    f"- Duration: {duration // 3600}h {(duration % 3600) // 60}m {duration % 60}s",
                 ]
             )
         )
