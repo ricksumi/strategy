@@ -59,6 +59,7 @@ Short pullback: current price >= signal close * 1.004
 Long confirmation: price rebounds by max(0.4%, ATR percentage * 0.15) from the pullback low
 Short confirmation: price falls by max(0.4%, ATR percentage * 0.15) from the pullback high
 Signal window: 300 seconds
+Invalidate the current signal when adverse pullback exceeds 1.5 ATR
 Order type after confirmation: MARKET
 ```
 

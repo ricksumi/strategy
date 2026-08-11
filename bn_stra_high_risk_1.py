@@ -69,6 +69,7 @@ class BotConfig:
     atr_confirm_factor: Decimal
     atr_stop_multiplier: Decimal
     max_ema_atr_distance: Decimal
+    max_pullback_atr_distance: Decimal
     contract_position_filter: bool
     crowded_short_global_max: Decimal
     crowded_short_top_min: Decimal
@@ -133,6 +134,7 @@ class BotConfig:
             atr_confirm_factor=Decimal(str(raw.get("atr_confirm_factor", "0.15"))),
             atr_stop_multiplier=Decimal(str(raw.get("atr_stop_multiplier", "1.5"))),
             max_ema_atr_distance=Decimal(str(raw.get("max_ema_atr_distance", "1.5"))),
+            max_pullback_atr_distance=Decimal(str(raw.get("max_pullback_atr_distance", "1.5"))),
             contract_position_filter=bool(raw.get("contract_position_filter", True)),
             crowded_short_global_max=Decimal(str(raw.get("crowded_short_global_max", "0.65"))),
             crowded_short_top_min=Decimal(str(raw.get("crowded_short_top_min", "1.20"))),
@@ -203,8 +205,8 @@ class BotConfig:
             raise ValueError("ATR sizing thresholds must be ordered and no greater than atr_max_pct")
         if not (0 < self.atr_reduced_size_factor <= 1 and 0 < self.atr_high_size_factor <= 1):
             raise ValueError("ATR size factors must be in (0, 1]")
-        if self.atr_confirm_factor < 0 or self.max_ema_atr_distance <= 0:
-            raise ValueError("ATR confirmation factor must be non-negative and EMA distance must be positive")
+        if self.atr_confirm_factor < 0 or self.max_ema_atr_distance <= 0 or self.max_pullback_atr_distance <= 0:
+            raise ValueError("ATR confirmation factor must be non-negative and ATR distance limits must be positive")
         if self.atr_stop_multiplier <= 0:
             raise ValueError("atr_stop_multiplier must be positive")
         if self.stop_update_min_pct < 0:
@@ -253,6 +255,8 @@ class PositionState:
     pending_confirm_pct: Decimal = Decimal("0")
     pending_pullback_reached: bool = False
     pending_pullback_extreme: Decimal = Decimal("0")
+    rejected_signal_side: str | None = None
+    rejected_signal_price: Decimal = Decimal("0")
     cooldown_until: float = 0
     daily_stop_day: str = ""
     daily_stop_count: int = 0
@@ -421,6 +425,12 @@ class BnStraHighRisk1:
         if signal == "none":
             self.clear_pending_signal(state)
             return
+        signal_price = candles[-1].close
+        if state.rejected_signal_side == signal and state.rejected_signal_price == signal_price:
+            return
+        if state.rejected_signal_price != signal_price:
+            state.rejected_signal_side = None
+            state.rejected_signal_price = Decimal("0")
         atr_pct = atr_percent(candles, self.config.atr_period)
         if not entry_near_ema(candles, self.config.ema_fast, atr_pct, self.config.max_ema_atr_distance):
             close = candles[-1].close
@@ -465,7 +475,8 @@ class BnStraHighRisk1:
                 self.clear_pending_signal(state)
                 return
         confirm_pct = dynamic_confirm_pct(self.config.pullback_confirm_pct, atr_pct, self.config.atr_confirm_factor)
-        if not self.pullback_entry_ready(state, signal, candles[-1].close, confirm_pct):
+        max_pullback_pct = atr_pct * self.config.max_pullback_atr_distance
+        if not self.pullback_entry_ready(state, signal, signal_price, confirm_pct, max_pullback_pct):
             return
         base_stop_pct = self.config.stop_loss_roi / Decimal(self.config.leverage)
         stop_distance_pct = capped_atr_stop_distance(base_stop_pct, atr_pct, self.config.atr_stop_multiplier)
@@ -867,7 +878,12 @@ class BnStraHighRisk1:
         )
 
     def pullback_entry_ready(
-        self, state: PositionState, side: str, signal_price: Decimal, confirm_pct: Decimal | None = None
+        self,
+        state: PositionState,
+        side: str,
+        signal_price: Decimal,
+        confirm_pct: Decimal | None = None,
+        max_pullback_pct: Decimal | None = None,
     ) -> bool:
         if self.config.pullback_entry_pct <= 0:
             return True
@@ -893,6 +909,24 @@ class BnStraHighRisk1:
             )
 
         mark_price = self.get_mark_price(state.symbol)
+        if max_pullback_pct is not None and pullback_limit_exceeded(
+            mark_price, side, state.pending_signal_price, max_pullback_pct
+        ):
+            adverse_move = adverse_pullback_pct(mark_price, side, state.pending_signal_price)
+            state.rejected_signal_side = side
+            state.rejected_signal_price = signal_price
+            logging.info(
+                "%s signal=%s invalidated: pullback exceeded ATR limit mark=%s signal_price=%s "
+                "adverse_move=%.3f%% limit=%.3f%%",
+                state.symbol,
+                side,
+                mark_price,
+                state.pending_signal_price,
+                adverse_move * Decimal("100"),
+                max_pullback_pct * Decimal("100"),
+            )
+            self.clear_pending_signal(state)
+            return False
         target = pullback_target_price(state.pending_signal_price, side, self.config.pullback_entry_pct)
         if not state.pending_pullback_reached:
             if not pullback_entry_allowed(mark_price, side, state.pending_signal_price, self.config.pullback_entry_pct):
@@ -1415,6 +1449,17 @@ def pullback_target_price(signal_price: Decimal, side: str, pullback_pct: Decima
 def pullback_entry_allowed(price: Decimal, side: str, signal_price: Decimal, pullback_pct: Decimal) -> bool:
     target = pullback_target_price(signal_price, side, pullback_pct)
     return price <= target if side == "long" else price >= target
+
+
+def adverse_pullback_pct(price: Decimal, side: str, signal_price: Decimal) -> Decimal:
+    if signal_price <= 0:
+        return Decimal("0")
+    move = (signal_price - price) / signal_price if side == "long" else (price - signal_price) / signal_price
+    return max(Decimal("0"), move)
+
+
+def pullback_limit_exceeded(price: Decimal, side: str, signal_price: Decimal, limit_pct: Decimal) -> bool:
+    return adverse_pullback_pct(price, side, signal_price) > limit_pct
 
 
 def pullback_confirmation_price(extreme_price: Decimal, side: str, confirm_pct: Decimal) -> Decimal:

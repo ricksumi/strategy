@@ -36,6 +36,7 @@
   "atr_confirm_factor": "0.15",
   "atr_stop_multiplier": "1.5",
   "max_ema_atr_distance": "1.5",
+  "max_pullback_atr_distance": "1.5",
   "contract_position_filter": true,
   "crowded_short_global_max": "0.65",
   "crowded_short_top_min": "1.20",

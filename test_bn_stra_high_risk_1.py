@@ -1,5 +1,6 @@
 import os
 import unittest
+from dataclasses import replace
 from decimal import Decimal
 from tempfile import TemporaryDirectory
 from pathlib import Path
@@ -26,6 +27,7 @@ from bn_stra_high_risk_1 import (
     entry_near_ema,
     load_env_file,
     margin_roi,
+    pullback_limit_exceeded,
     pullback_confirmation_price,
     pullback_entry_allowed,
     pullback_reversal_confirmed,
@@ -127,6 +129,34 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         self.assertEqual(pullback_confirmation_price(Decimal("100.5"), "short", Decimal("0.002")), Decimal("100.2990"))
         self.assertTrue(pullback_reversal_confirmed(Decimal("100.29"), "short", Decimal("100.5"), Decimal("0.002")))
         self.assertFalse(pullback_reversal_confirmed(Decimal("100.4"), "short", Decimal("100.5"), Decimal("0.002")))
+
+    def test_pullback_atr_limit_blocks_adverse_overshoot(self):
+        self.assertTrue(pullback_limit_exceeded(Decimal("94"), "long", Decimal("100"), Decimal("0.05")))
+        self.assertFalse(pullback_limit_exceeded(Decimal("95"), "long", Decimal("100"), Decimal("0.05")))
+        self.assertTrue(pullback_limit_exceeded(Decimal("106"), "short", Decimal("100"), Decimal("0.05")))
+        self.assertFalse(pullback_limit_exceeded(Decimal("105"), "short", Decimal("100"), Decimal("0.05")))
+
+    def test_pullback_overshoot_rejects_current_signal(self):
+        config = replace(
+            test_config(False),
+            pullback_entry_pct=Decimal("0.004"),
+            pullback_confirm_pct=Decimal("0.004"),
+            pullback_signal_wait_seconds=300,
+        )
+        bot = BnStraHighRisk1(config, FakeClient([]))
+        state = bot.states["ETHUSDT"]
+
+        with patch.object(bot, "get_mark_price", return_value=Decimal("94")), patch(
+            "bn_stra_high_risk_1.time.time", return_value=100
+        ):
+            ready = bot.pullback_entry_ready(
+                state, "long", Decimal("100"), Decimal("0.004"), Decimal("0.05")
+            )
+
+        self.assertFalse(ready)
+        self.assertEqual(state.rejected_signal_side, "long")
+        self.assertEqual(state.rejected_signal_price, Decimal("100"))
+        self.assertIsNone(state.pending_signal_side)
 
     def test_client_order_id_is_short_enough(self):
         self.assertLessEqual(len(client_order_id("SNDKUSDT", "managed")), 36)
@@ -603,6 +633,7 @@ def test_config(dry_run=True, symbols=("ETHUSDT",), interval="5m"):
         atr_confirm_factor=Decimal("0.15"),
         atr_stop_multiplier=Decimal("1.5"),
         max_ema_atr_distance=Decimal("1.5"),
+        max_pullback_atr_distance=Decimal("1.5"),
         contract_position_filter=True,
         crowded_short_global_max=Decimal("0.65"),
         crowded_short_top_min=Decimal("1.20"),
