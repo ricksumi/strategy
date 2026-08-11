@@ -315,6 +315,17 @@ class BnStraHighRisk1Tests(unittest.TestCase):
             ],
         )
 
+    def test_trade_fills_are_queried_when_order_lookup_fails(self):
+        client = FillPriceClient(order_lookup_fails=True)
+        bot = BnStraHighRisk1(test_config(False), client)
+
+        price = bot.resolve_order_fill_price(
+            "龙虾USDT", {"orderId": 42, "avgPrice": "0"}, Decimal("0.02934")
+        )
+
+        self.assertEqual(price, Decimal("0.03435"))
+        self.assertEqual(client.calls[-1][1], "/fapi/v1/userTrades")
+
     def test_was_stop_order_filled_queries_algo_order(self):
         client = RecordingClient(algo_order_response={"algoStatus": "FINISHED"})
         bot = BnStraHighRisk1(test_config(False), client)
@@ -526,13 +537,16 @@ class KlineClient(BinanceClient):
 
 
 class FillPriceClient(BinanceClient):
-    def __init__(self):
+    def __init__(self, order_lookup_fails=False):
         self.calls = []
+        self.order_lookup_fails = order_lookup_fails
 
     def signed_request(self, method, path, params=None):
         params = params or {}
         self.calls.append((method, path, params))
         if method == "GET" and path == "/fapi/v1/order":
+            if self.order_lookup_fails:
+                raise RuntimeError("Order does not exist")
             return {"orderId": 42, "avgPrice": "0"}
         if method == "GET" and path == "/fapi/v1/userTrades":
             return [

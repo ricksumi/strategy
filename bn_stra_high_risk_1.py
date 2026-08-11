@@ -721,6 +721,10 @@ class BnStraHighRisk1:
                 avg_price = Decimal(str(status.get("avgPrice", "0")))
                 if avg_price > 0:
                     return avg_price
+            except Exception as exc:
+                logging.warning("%s order lookup failed for order_id=%s; trying trade fills: %s", symbol, order_id, exc)
+
+            try:
                 trades = self.client.signed_request(
                     "GET", "/fapi/v1/userTrades", {"symbol": symbol, "orderId": order_id, "limit": 1000}
                 )
@@ -736,7 +740,7 @@ class BnStraHighRisk1:
                     if total_notional > 0:
                         return total_notional / total_qty
             except Exception as exc:
-                logging.warning("%s could not resolve fill price for order_id=%s: %s", symbol, order_id, exc)
+                logging.warning("%s trade fill lookup failed for order_id=%s: %s", symbol, order_id, exc)
 
         logging.warning("%s order_id=%s returned no fill price; using fallback=%s", symbol, order_id, fallback)
         return fallback
