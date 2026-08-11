@@ -1,7 +1,7 @@
 {
   "strategy": "bn-stra-high-risk-1",
   "strategy_mode": "high_vol",
-  "symbols": ["BMTUSDT", "龙虾USDT", "ACTUSDT", "CAPUSDT", "NILUSDT", "BOMEUSDT", "COAIUSDT", "TUTUSDT", "ESPUSDT", "MUBARAKUSDT", "GUAUSDT", "BLUAIUSDT", "CYSUSDT", "SQDUSDT", "PROMUSDT", "BSPUSDT", "BLESSUSDT"],
+  "symbols": ["BMTUSDT", "龙虾USDT", "ACTUSDT", "CAPUSDT", "NILUSDT", "BOMEUSDT", "COAIUSDT", "TUTUSDT", "ESPUSDT", "MUBARAKUSDT", "GUAUSDT", "BLUAIUSDT", "CYSUSDT", "SQDUSDT", "PROMUSDT", "BSPUSDT", "BLESSUSDT", "MAVUSDT", "CLOUSDT", "BTRUSDT"],
   "interval": "5m",
   "leverage": 5,
   "margin_per_trade": "200",
