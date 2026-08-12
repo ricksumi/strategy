@@ -339,6 +339,93 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         self.assertEqual(client.calls[-1][2]["reduceOnly"], "true")
         self.assertIn("clientAlgoId", client.calls[-1][2])
 
+    def test_entry_order_uses_ioc_limit_with_slippage_cap(self):
+        client = RecordingClient()
+        bot = BnStraHighRisk1(test_config(False), client)
+        bot.rules = {
+            "ETHUSDT": SymbolRules(
+                tick_size=Decimal("0.01"), step_size=Decimal("0.001"), min_qty=Decimal("0")
+            )
+        }
+
+        bot.place_entry_order("ETHUSDT", "BUY", Decimal("1"), Decimal("100"), "long")
+        buy = client.calls[-1][2]
+        bot.place_entry_order("ETHUSDT", "SELL", Decimal("1"), Decimal("100"), "short")
+        sell = client.calls[-1][2]
+
+        self.assertEqual(buy["type"], "LIMIT")
+        self.assertEqual(buy["timeInForce"], "IOC")
+        self.assertEqual(buy["price"], "100.2")
+        self.assertEqual(sell["price"], "99.8")
+
+    def test_zero_fill_ioc_entry_does_not_create_position_or_stop(self):
+        with TemporaryDirectory() as tmpdir, patch.dict(
+            "os.environ", {"BN_STRA_STATE_FILE": str(Path(tmpdir) / "state.json")}
+        ):
+            client = EntryExecutionClient(Decimal("0"))
+            bot = BnStraHighRisk1(test_config(False), client)
+            bot.rules = {
+                "ETHUSDT": SymbolRules(
+                    tick_size=Decimal("0.01"), step_size=Decimal("1"), min_qty=Decimal("1")
+                )
+            }
+            with patch.object(bot, "get_mark_price", return_value=Decimal("100")):
+                bot.open_position("ETHUSDT", "long")
+
+        self.assertEqual(bot.states["ETHUSDT"].quantity, Decimal("0"))
+        self.assertEqual(client.stop_quantities, [])
+
+    def test_partial_ioc_entry_protects_only_executed_quantity(self):
+        with TemporaryDirectory() as tmpdir, patch.dict(
+            "os.environ", {"BN_STRA_STATE_FILE": str(Path(tmpdir) / "state.json")}
+        ):
+            client = EntryExecutionClient(Decimal("5"))
+            bot = BnStraHighRisk1(test_config(False), client)
+            bot.rules = {
+                "ETHUSDT": SymbolRules(
+                    tick_size=Decimal("0.01"), step_size=Decimal("1"), min_qty=Decimal("1")
+                )
+            }
+            with patch.object(bot, "get_mark_price", return_value=Decimal("100")):
+                bot.open_position("ETHUSDT", "long")
+
+        state = bot.states["ETHUSDT"]
+        self.assertEqual(state.quantity, Decimal("5"))
+        self.assertEqual(state.initial_quantity, Decimal("5"))
+        self.assertEqual(state.initial_margin, Decimal("100.2"))
+        self.assertEqual(client.stop_quantities, ["5"])
+
+    def test_profit_lock_trigger_closes_thirty_percent_and_protects_remainder(self):
+        with TemporaryDirectory() as tmpdir, patch.dict(
+            "os.environ", {"BN_STRA_STATE_FILE": str(Path(tmpdir) / "state.json")}
+        ):
+            bot = BnStraHighRisk1(
+                replace(test_config(True), profit_lock_roi=Decimal("0.05")), FakeClient([])
+            )
+            bot.rules = {
+                "ETHUSDT": SymbolRules(
+                    tick_size=Decimal("0.01"), step_size=Decimal("1"), min_qty=Decimal("1")
+                )
+            }
+            state = bot.states["ETHUSDT"]
+            state.side = "long"
+            state.entry_price = Decimal("100")
+            state.quantity = Decimal("10")
+            state.initial_quantity = Decimal("10")
+            state.initial_margin = Decimal("200")
+            state.best_price = Decimal("100")
+            state.stop_price = Decimal("98")
+            state.stop_order_id = 99
+            state.stop_client_id = "initial"
+            state.opened_at_ms = 1
+
+            bot.manage_open_position(state, Decimal("102.4"))
+
+        self.assertEqual(state.quantity, Decimal("7"))
+        self.assertTrue(state.partial_take_1_done)
+        self.assertTrue(state.breakeven_done)
+        self.assertEqual(state.stop_price, Decimal("101"))
+
     def test_replace_stop_order_places_new_protection_before_canceling_old(self):
         client = RecordingClient()
         bot = BnStraHighRisk1(test_config(False), client)
@@ -531,11 +618,14 @@ class BnStraHighRisk1Tests(unittest.TestCase):
             self.assertEqual(bot.global_daily_stop_count, 5)
 
     def test_global_daily_stop_limit_blocks_new_entries(self):
-        config = replace(test_config(False), global_daily_stop_limit=5)
-        bot = BnStraHighRisk1(config, FakeClient([]))
-        bot.global_daily_stop_count = 6
+        with TemporaryDirectory() as tmpdir, patch.dict(
+            "os.environ", {"BN_STRA_STATE_FILE": str(Path(tmpdir) / "state.json")}
+        ):
+            config = replace(test_config(False), global_daily_stop_limit=5)
+            bot = BnStraHighRisk1(config, FakeClient([]))
+            bot.global_daily_stop_count = 6
 
-        self.assertFalse(bot.entry_limits_allow(bot.states["ETHUSDT"]))
+            self.assertFalse(bot.entry_limits_allow(bot.states["ETHUSDT"]))
 
     def test_global_daily_stop_limit_allows_fifth_stop_count(self):
         config = replace(test_config(False), global_daily_stop_limit=5)
@@ -646,6 +736,13 @@ class RecordingClient(BinanceClient):
         self.calls.append((method, path, params))
         if method == "POST" and path == "/fapi/v1/algoOrder":
             return {"algoId": 123, "clientAlgoId": params["clientAlgoId"]}
+        if method == "POST" and path == "/fapi/v1/order":
+            return {
+                "orderId": 456,
+                "avgPrice": params.get("price", "0"),
+                "executedQty": params.get("quantity", "0"),
+                "status": "FILLED",
+            }
         if method == "DELETE" and path == "/fapi/v1/algoOrder":
             return {}
         if method == "GET" and path == "/fapi/v1/algoOrder":
@@ -666,6 +763,28 @@ class InsufficientMarginClient(BinanceClient):
             return {"totalMarginBalance": "1000", "availableBalance": "10"}
         if method == "POST" and path == "/fapi/v1/order":
             self.market_orders += 1
+        raise AssertionError((method, path, params))
+
+
+class EntryExecutionClient(BinanceClient):
+    def __init__(self, executed_quantity):
+        self.executed_quantity = executed_quantity
+        self.stop_quantities = []
+
+    def signed_request(self, method, path, params=None):
+        params = params or {}
+        if method == "GET" and path == "/fapi/v2/account":
+            return {"totalMarginBalance": "1000", "availableBalance": "1000"}
+        if method == "POST" and path == "/fapi/v1/order":
+            return {
+                "orderId": 456,
+                "avgPrice": params["price"] if self.executed_quantity > 0 else "0",
+                "executedQty": str(self.executed_quantity),
+                "status": "EXPIRED" if self.executed_quantity < Decimal("10") else "FILLED",
+            }
+        if method == "POST" and path == "/fapi/v1/algoOrder":
+            self.stop_quantities.append(params["quantity"])
+            return {"algoId": 123, "clientAlgoId": params["clientAlgoId"]}
         raise AssertionError((method, path, params))
 
 
@@ -726,6 +845,7 @@ def test_config(dry_run=True, symbols=("ETHUSDT",), interval="5m"):
         leverage=5,
         allocation_fraction=Decimal("0.2"),
         margin_per_trade=Decimal("200"),
+        entry_max_slippage_pct=Decimal("0.002"),
         stop_loss_roi=Decimal("0.10"),
         breakeven_roi=Decimal("0.10"),
         profit_lock_roi=Decimal("0.03"),
@@ -736,8 +856,8 @@ def test_config(dry_run=True, symbols=("ETHUSDT",), interval="5m"):
         trailing_tier_2_callback=Decimal("0.012"),
         trailing_tier_3_roi=Decimal("0.80"),
         trailing_tier_3_callback=Decimal("0.01"),
-        partial_take_1_roi=Decimal("0.25"),
-        partial_take_1_fraction=Decimal("0.25"),
+        partial_take_1_roi=Decimal("0.12"),
+        partial_take_1_fraction=Decimal("0.30"),
         partial_take_2_roi=Decimal("0.40"),
         partial_take_2_fraction=Decimal("0.25"),
         pullback_entry_pct=Decimal("0"),

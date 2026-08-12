@@ -1,12 +1,12 @@
 # bn-stra-high-risk-1
 
-`bn-stra-high-risk-1` is a high-risk Binance USD-M Futures trading bot. It targets volatile perpetual contracts and uses trend, volatility, pullback, and reversal-confirmation filters before opening a market position.
+`bn-stra-high-risk-1` is a high-risk Binance USD-M Futures trading bot. It targets volatile perpetual contracts and uses trend, volatility, pullback, and reversal-confirmation filters before opening a position.
 
 The example configuration defaults to `dry_run: true` and does not place real orders. Binance Futures Testnet may not list the configured high-volatility symbols, so use supported symbols when testing order execution.
 
 ## Risk warning
 
-This strategy can lose money quickly. It uses leverage, market orders, conditional stop orders, and dynamic stop replacement. Network latency, API errors, slippage, funding fees, liquidation rules, exchange outages, and symbol-specific trading limits can materially change results.
+This strategy can lose money quickly. It uses leverage, IOC limit entry orders, market exit orders, conditional stop orders, and dynamic stop replacement. Network latency, API errors, slippage, funding fees, liquidation rules, exchange outages, and symbol-specific trading limits can materially change results.
 
 The configured margin is `200 USDT` per new position. ATR affects entry eligibility and stop distance, but never reduces the configured margin. Do not run it with funds you cannot afford to lose.
 
@@ -63,7 +63,7 @@ Long recross: mark price returns to or above the original signal close after rev
 Short recross: mark price returns to or below the original signal close after reversal confirmation
 Recross stability: 2 consecutive polls within a separate 180-second window
 Invalidate the current signal when adverse pullback exceeds 1.5 ATR
-Order type after recross confirmation: MARKET
+Entry order: LIMIT IOC capped at 0.20% beyond the latest confirmation mark price
 ```
 
 When the signal window expires, the bot starts a new window from the latest qualifying signal.
@@ -79,6 +79,8 @@ ATR never changes margin or order quantity
 
 At full size, `200 USDT` of margin with 5x leverage controls approximately `1,000 USDT` of notional exposure.
 
+The entry limit is calculated from the latest mark price used for confirmation. A long may fill no higher than `mark * 1.002`; a short may fill no lower than `mark * 0.998`, adjusted conservatively to the symbol tick size. An IOC order cancels any unfilled quantity immediately. A zero fill abandons the signal, while a partial fill is retained at its actual size and receives a matching protective stop.
+
 The legacy `allocation_fraction` field is accepted for configuration compatibility but does not control live position margin. Before an order is placed, the bot checks Binance `availableBalance`. If it cannot cover the configured margin plus an opening-fee allowance, the order is skipped and a rate-limited Hermes notification is queued.
 
 The configured `stop_loss_roi` is a hard initial-loss cap before fees and slippage. With the default `10%` ROI cap, `200 USDT` margin risks at most approximately `20 USDT` before fees and slippage. ATR may tighten the stop but cannot widen it beyond that cap.
@@ -87,17 +89,17 @@ The configured `stop_loss_roi` is a hard initial-loss cap before fees and slippa
 
 ```text
 Breakeven trigger = +12% margin ROI, approximately a 2.4% favorable price move
+Close 30% of the original quantity at +12% margin ROI
 Profit locked at trigger = +5% margin ROI, approximately a 1.0% favorable price move
 Trailing activation = +25% margin ROI, approximately a 5% favorable price move
-Close 25% of the original quantity at +25% margin ROI
 Close another 25% of the original quantity at +40% margin ROI
-Trail the remaining 50% position
+Trail the remaining 70% position before +40% ROI and 45% afterward
 Trailing callback at +25% ROI = 2% of price
 Trailing callback at +40% ROI = 1.5% of price
 Trailing callback at +60% ROI = 1% of price
 ```
 
-At the first profit trigger, the bot moves the stop to the configured `profit_lock_roi` instead of nominal breakeven. With 5x leverage and `profit_lock_roi=0.05`, the stop is placed approximately 1.0% beyond entry. This buffer is intended to absorb taker fees and moderate stop-market slippage, but unusually thin order books can still produce a loss. Trailing management starts only after the separate trailing activation threshold is reached. Its callback tightens as the best margin ROI reaches each tier, and a reached tier never loosens the current stop.
+At the first profit trigger, the bot realizes 30% of the original position and moves the remaining position's stop to the configured `profit_lock_roi` instead of nominal breakeven. With 5x leverage and `profit_lock_roi=0.05`, the stop is placed approximately 1.0% beyond entry. This buffer is intended to absorb taker fees and moderate stop-market slippage, but unusually thin order books can still reduce the result. Trailing management starts only after the separate trailing activation threshold is reached. Its callback tightens as the best margin ROI reaches each tier, and a reached tier never loosens the current stop.
 
 ATR above 6% blocks new entries; ATR within the allowed range does not change position size. Managed trailing stops are replaced only when the stop improves by at least 0.2%.
 

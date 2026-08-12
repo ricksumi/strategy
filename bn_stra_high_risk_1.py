@@ -38,6 +38,7 @@ class BotConfig:
     leverage: int
     allocation_fraction: Decimal
     margin_per_trade: Decimal
+    entry_max_slippage_pct: Decimal
     stop_loss_roi: Decimal
     breakeven_roi: Decimal
     profit_lock_roi: Decimal
@@ -108,6 +109,7 @@ class BotConfig:
             leverage=int(raw.get("leverage", 5)),
             allocation_fraction=Decimal(str(raw.get("allocation_fraction", "0.2"))),
             margin_per_trade=Decimal(str(raw.get("margin_per_trade", "200"))),
+            entry_max_slippage_pct=Decimal(str(raw.get("entry_max_slippage_pct", "0.002"))),
             stop_loss_roi=Decimal(str(raw.get("stop_loss_roi", "0.10"))),
             breakeven_roi=Decimal(str(raw.get("breakeven_roi", "0.10"))),
             profit_lock_roi=Decimal(str(raw.get("profit_lock_roi", "0"))),
@@ -183,6 +185,8 @@ class BotConfig:
             raise ValueError("allocation_fraction must be in (0, 1]")
         if self.margin_per_trade <= 0:
             raise ValueError("margin_per_trade must be positive")
+        if self.entry_max_slippage_pct <= 0 or self.entry_max_slippage_pct > Decimal("0.05"):
+            raise ValueError("entry_max_slippage_pct must be in (0, 0.05]")
         if self.ema_fast >= self.ema_slow:
             raise ValueError("ema_fast must be lower than ema_slow")
         if self.fee_rate < 0:
@@ -587,21 +591,49 @@ class BnStraHighRisk1:
             "%s opening %s qty=%s margin=%s stop_distance_pct=%s mark=%s",
             symbol, side, qty, margin, stop_distance_pct, mark_price,
         )
-        order = self.place_market_order(symbol, order_side, qty)
+        order = self.place_entry_order(symbol, order_side, qty, mark_price, side)
+        executed_qty = Decimal(str(order.get("executedQty", "0")))
+        if executed_qty <= 0:
+            logging.info(
+                "%s entry IOC expired without a fill side=%s reference=%s max_slippage=%.3f%%",
+                symbol,
+                side,
+                mark_price,
+                self.config.entry_max_slippage_pct * Decimal("100"),
+            )
+            self.clear_pending_signal(self.states[symbol])
+            return
+        if executed_qty < qty:
+            logging.warning(
+                "%s entry IOC partially filled requested=%s executed=%s; protecting actual quantity",
+                symbol,
+                qty,
+                executed_qty,
+            )
+            self.notifier.send(
+                "\n".join(
+                    [
+                        f"[PARTIAL ENTRY] {symbol} {side.upper()}",
+                        f"- Requested quantity: {format_decimal(qty)}",
+                        f"- Executed quantity: {format_decimal(executed_qty)}",
+                        "- The unfilled quantity was canceled and the filled position remains protected.",
+                    ]
+                )
+            )
         entry_price = self.resolve_order_fill_price(symbol, order, mark_price)
         stop_price = stop_price_from_distance(entry_price, side, stop_distance_pct)
         stop_price = round_stop_price(stop_price, self.rules[symbol].tick_size, side)
         try:
-            stop_order = self.place_stop_order(symbol, side, qty, stop_price, "initial")
+            stop_order = self.place_stop_order(symbol, side, executed_qty, stop_price, "initial")
         except Exception:
-            logging.exception("%s stop order failed after market entry; emergency closing position", symbol)
-            self.emergency_close_position(symbol, side, qty)
+            logging.exception("%s stop order failed after IOC entry; emergency closing position", symbol)
+            self.emergency_close_position(symbol, side, executed_qty)
             raise
 
         state = self.states[symbol]
         state.side = side
         state.entry_price = entry_price
-        state.quantity = qty
+        state.quantity = executed_qty
         state.best_price = entry_price
         state.stop_price = stop_price
         state.stop_order_id = int(stop_order.get("algoId")) if stop_order and stop_order.get("algoId") else None
@@ -610,8 +642,8 @@ class BnStraHighRisk1:
         state.breakeven_done = False
         state.trailing_active = False
         state.opened_at_ms = int(time.time() * 1000)
-        state.initial_margin = margin
-        state.initial_quantity = qty
+        state.initial_margin = entry_price * executed_qty / Decimal(self.config.leverage)
+        state.initial_quantity = executed_qty
         state.partial_take_1_done = False
         state.partial_take_2_done = False
         self.clear_pending_signal(state)
@@ -621,7 +653,7 @@ class BnStraHighRisk1:
             symbol,
             side,
             entry_price,
-            qty,
+            executed_qty,
             stop_price,
             state.stop_order_id,
             state.stop_client_id,
@@ -1294,17 +1326,40 @@ class BnStraHighRisk1:
         else:
             state.quantity = abs(amt)
 
-    def place_market_order(self, symbol: str, side: str, quantity: Decimal) -> dict[str, Any]:
+    def place_entry_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Decimal,
+        reference_price: Decimal,
+        position_side: str,
+    ) -> dict[str, Any]:
+        multiplier = (
+            Decimal("1") + self.config.entry_max_slippage_pct
+            if side == "BUY"
+            else Decimal("1") - self.config.entry_max_slippage_pct
+        )
+        limit_price = round_stop_price(
+            reference_price * multiplier,
+            self.rules[symbol].tick_size,
+            position_side,
+        )
         params = {
             "symbol": symbol,
             "side": side,
-            "type": "MARKET",
+            "type": "LIMIT",
+            "timeInForce": "IOC",
             "quantity": format_decimal(quantity),
+            "price": format_decimal(limit_price),
             "newOrderRespType": "RESULT",
         }
         if self.config.dry_run:
-            logging.info("[dry-run] market order %s", params)
-            return {"avgPrice": str(self.get_mark_price(symbol)), "executedQty": str(quantity)}
+            logging.info("[dry-run] IOC entry order %s", params)
+            return {
+                "avgPrice": str(reference_price),
+                "executedQty": str(quantity),
+                "status": "FILLED",
+            }
         return self.client.signed_request("POST", "/fapi/v1/order", params)
 
     def emergency_close_position(self, symbol: str, position_side: str, quantity: Decimal) -> None:
