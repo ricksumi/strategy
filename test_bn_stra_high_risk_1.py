@@ -26,6 +26,7 @@ from bn_stra_high_risk_1 import (
     client_order_id,
     contract_position_allows,
     dynamic_confirm_pct,
+    entry_signal_price_allows,
     entry_near_ema,
     load_env_file,
     margin_roi,
@@ -160,7 +161,7 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         self.assertEqual(state.rejected_signal_price, Decimal("100"))
         self.assertIsNone(state.pending_signal_side)
 
-    def test_pullback_requires_two_consecutive_signal_recross_polls(self):
+    def test_pullback_requires_closed_one_minute_signal_recross(self):
         config = replace(
             test_config(False),
             pullback_entry_pct=Decimal("0.004"),
@@ -168,43 +169,35 @@ class BnStraHighRisk1Tests(unittest.TestCase):
             pullback_signal_wait_seconds=300,
             require_signal_recross=True,
             signal_recross_wait_seconds=180,
-            signal_recross_confirm_polls=2,
-        )
-        bot = BnStraHighRisk1(config, FakeClient([]))
-        state = bot.states["ETHUSDT"]
-
-        samples = [
-            (100, Decimal("99.6"), False),
-            (115, Decimal("99.8"), False),
-            (130, Decimal("100.1"), False),
-            (145, Decimal("100.2"), True),
-        ]
-        for now, mark, expected in samples:
-            with patch.object(bot, "get_mark_price", return_value=mark), patch(
-                "bn_stra_high_risk_1.time.time", return_value=now
-            ):
-                ready = bot.pullback_entry_ready(
-                    state, "long", Decimal("100"), Decimal("0.002"), Decimal("0.05")
-                )
-            self.assertEqual(ready, expected)
-
-    def test_signal_recross_confirmation_resets_when_price_falls_back(self):
-        config = replace(
-            test_config(False),
-            require_signal_recross=True,
-            signal_recross_confirm_polls=2,
         )
         bot = BnStraHighRisk1(config, FakeClient([]))
         state = bot.states["ETHUSDT"]
         state.pending_signal_side = "long"
         state.pending_signal_price = Decimal("100")
         state.pending_reversal_confirmed = True
+        state.pending_recross_candle_open_after_ms = 120000
+        eligible = Candle(
+            open_time=120000,
+            open=Decimal("99.8"),
+            high=Decimal("100.3"),
+            low=Decimal("99.7"),
+            close=Decimal("100.1"),
+            close_time=179999,
+        )
 
-        self.assertFalse(bot.signal_recross_ready(state, "long", Decimal("100.1")))
-        self.assertFalse(bot.signal_recross_ready(state, "long", Decimal("99.9")))
-        self.assertEqual(state.pending_recross_count, 0)
-        self.assertFalse(bot.signal_recross_ready(state, "long", Decimal("100.1")))
-        self.assertTrue(bot.signal_recross_ready(state, "long", Decimal("100.2")))
+        with patch.object(bot, "fetch_closed_candles", return_value=[]):
+            self.assertFalse(bot.signal_recross_ready(state, "long", Decimal("100.2")))
+        with patch.object(bot, "fetch_closed_candles", return_value=[eligible]):
+            self.assertTrue(bot.signal_recross_ready(state, "long", Decimal("100.2")))
+            self.assertFalse(bot.signal_recross_ready(state, "long", Decimal("99.9")))
+
+    def test_entry_signal_distance_blocks_chasing(self):
+        limit = Decimal("0.003")
+        self.assertTrue(entry_signal_price_allows(Decimal("100.3"), Decimal("100"), "long", limit))
+        self.assertFalse(entry_signal_price_allows(Decimal("100.31"), Decimal("100"), "long", limit))
+        self.assertFalse(entry_signal_price_allows(Decimal("99.9"), Decimal("100"), "long", limit))
+        self.assertTrue(entry_signal_price_allows(Decimal("99.7"), Decimal("100"), "short", limit))
+        self.assertFalse(entry_signal_price_allows(Decimal("99.69"), Decimal("100"), "short", limit))
 
     def test_client_order_id_is_short_enough(self):
         self.assertLessEqual(len(client_order_id("SNDKUSDT", "managed")), 36)
@@ -276,6 +269,17 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         bot = BnStraHighRisk1(config, FakeClient([]))
 
         self.assertEqual(bot.margin_per_symbol(Decimal("1500")), Decimal("200"))
+
+    def test_paper_only_mode_hard_blocks_real_entry(self):
+        client = EntryExecutionClient(Decimal("10"))
+        bot = BnStraHighRisk1(
+            replace(test_config(False), paper_trading_only=True),
+            client,
+        )
+
+        bot.open_position("ETHUSDT", "long")
+
+        self.assertEqual(client.stop_quantities, [])
 
     def test_insufficient_margin_notifies_without_placing_order(self):
         with TemporaryDirectory() as tmpdir:

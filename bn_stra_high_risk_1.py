@@ -98,6 +98,9 @@ class BotConfig:
     hermes_socket_path: str = ""
     hermes_target: str = "weixin"
     paper_signals_after_global_stop: bool = False
+    paper_trading_only: bool = False
+    entry_signal_max_distance_pct: Decimal = Decimal("0.003")
+    entry_signal_max_atr_factor: Decimal = Decimal("0.25")
 
     @classmethod
     def from_file(cls, path: str) -> "BotConfig":
@@ -172,6 +175,13 @@ class BotConfig:
             hermes_socket_path=str(raw.get("hermes_socket_path", "")),
             hermes_target=str(raw.get("hermes_target", "weixin")),
             paper_signals_after_global_stop=bool(raw.get("paper_signals_after_global_stop", False)),
+            paper_trading_only=bool(raw.get("paper_trading_only", False)),
+            entry_signal_max_distance_pct=Decimal(
+                str(raw.get("entry_signal_max_distance_pct", "0.003"))
+            ),
+            entry_signal_max_atr_factor=Decimal(
+                str(raw.get("entry_signal_max_atr_factor", "0.25"))
+            ),
         )
 
     def validate(self) -> None:
@@ -235,6 +245,10 @@ class BotConfig:
             raise ValueError("daily_stop_limit must be positive")
         if self.global_daily_stop_limit < 0:
             raise ValueError("global_daily_stop_limit cannot be negative")
+        if self.entry_signal_max_distance_pct <= 0:
+            raise ValueError("entry_signal_max_distance_pct must be positive")
+        if self.entry_signal_max_atr_factor <= 0:
+            raise ValueError("entry_signal_max_atr_factor must be positive")
         if self.max_concurrent_positions < 0:
             raise ValueError("max_concurrent_positions cannot be negative")
         if self.working_type not in {"MARK_PRICE", "CONTRACT_PRICE"}:
@@ -283,6 +297,7 @@ class PositionState:
     pending_pullback_extreme: Decimal = Decimal("0")
     pending_reversal_confirmed: bool = False
     pending_recross_count: int = 0
+    pending_recross_candle_open_after_ms: int = 0
     rejected_signal_side: str | None = None
     rejected_signal_price: Decimal = Decimal("0")
     cooldown_until: float = 0
@@ -463,9 +478,12 @@ class BnStraHighRisk1:
             return
 
         global_paused = self.global_entries_paused()
+        paper_mode = self.config.paper_trading_only or (
+            global_paused and self.config.paper_signals_after_global_stop
+        )
         if global_paused:
             self.log_and_notify_global_pause()
-        elif not self.entry_limits_allow(state):
+        if not paper_mode and not self.entry_limits_allow(state):
             return
         if time.time() < state.cooldown_until:
             return
@@ -537,11 +555,35 @@ class BnStraHighRisk1:
         max_pullback_pct = atr_pct * self.config.max_pullback_atr_distance
         if not self.pullback_entry_ready(state, signal, signal_price, confirm_pct, max_pullback_pct):
             return
+        entry_price = self.get_mark_price(symbol)
+        signal_distance_limit = min(
+            self.config.entry_signal_max_distance_pct,
+            atr_pct * self.config.entry_signal_max_atr_factor,
+        )
+        if not entry_signal_price_allows(
+            entry_price, state.pending_signal_price, signal, signal_distance_limit
+        ):
+            distance = adverse_entry_signal_distance(entry_price, state.pending_signal_price, signal)
+            logging.info(
+                "%s signal=%s invalidated: entry too far from original signal entry=%s signal_price=%s "
+                "distance=%.3f%% limit=%.3f%% atr=%.3f%%",
+                symbol,
+                signal,
+                entry_price,
+                state.pending_signal_price,
+                distance * Decimal("100"),
+                signal_distance_limit * Decimal("100"),
+                atr_pct * Decimal("100"),
+            )
+            state.rejected_signal_side = signal
+            state.rejected_signal_price = state.pending_signal_price
+            self.clear_pending_signal(state)
+            return
         base_stop_pct = self.config.stop_loss_roi / Decimal(self.config.leverage)
         stop_distance_pct = capped_atr_stop_distance(base_stop_pct, atr_pct, self.config.atr_stop_multiplier)
-        if global_paused and self.config.paper_signals_after_global_stop:
-            self.open_paper_position(symbol, signal, stop_distance_pct)
-        elif not global_paused:
+        if paper_mode:
+            self.open_paper_position(symbol, signal, stop_distance_pct, entry_price)
+        else:
             self.open_position(symbol, signal, stop_distance_pct)
 
     def global_entries_paused(self) -> bool:
@@ -592,6 +634,10 @@ class BnStraHighRisk1:
         side: str,
         stop_distance_pct: Decimal | None = None,
     ) -> None:
+        if self.config.paper_trading_only:
+            logging.error("%s real entry suppressed by paper_trading_only", symbol)
+            self.clear_pending_signal(self.states[symbol])
+            return
         if not self.entry_limits_allow(self.states[symbol]):
             self.clear_pending_signal(self.states[symbol])
             return
@@ -706,7 +752,13 @@ class BnStraHighRisk1:
     def margin_per_symbol(self, equity: Decimal) -> Decimal:
         return self.config.margin_per_trade
 
-    def open_paper_position(self, symbol: str, side: str, stop_distance_pct: Decimal) -> None:
+    def open_paper_position(
+        self,
+        symbol: str,
+        side: str,
+        stop_distance_pct: Decimal,
+        entry_price: Decimal | None = None,
+    ) -> None:
         if symbol in self.paper_positions:
             return
         active_real_positions = sum(1 for state in self.states.values() if state.quantity != 0)
@@ -720,7 +772,7 @@ class BnStraHighRisk1:
             )
             self.clear_pending_signal(self.states[symbol])
             return
-        entry_price = self.get_mark_price(symbol)
+        entry_price = entry_price or self.get_mark_price(symbol)
         quantity = round_to_step(
             (self.config.margin_per_trade * Decimal(self.config.leverage)) / entry_price,
             self.rules[symbol].step_size,
@@ -885,6 +937,11 @@ class BnStraHighRisk1:
         self.save_runtime_state()
 
     def notify_paper_position_opened(self, position: PaperPosition) -> None:
+        reason = (
+            "Paper-only mode is enabled; no Binance entry order was submitted."
+            if self.config.paper_trading_only
+            else "Real entries are paused by the global daily stop limit; no Binance entry order was submitted."
+        )
         self.notifier.send(
             "\n".join(
                 [
@@ -894,7 +951,7 @@ class BnStraHighRisk1:
                     f"- Margin: {position.initial_margin:.4f} USDT",
                     f"- Notional: {(position.entry_price * position.quantity):.4f} USDT",
                     f"- Initial stop: {format_decimal(position.stop_price)}",
-                    "- This signal is tracked only because real entries are paused by the global daily stop limit.",
+                    f"- {reason}",
                 ]
             )
         )
@@ -1354,14 +1411,16 @@ class BnStraHighRisk1:
             return True
         state.pending_reversal_confirmed = True
         state.pending_recross_count = 0
+        now_ms = int(time.time() * 1000)
+        state.pending_recross_candle_open_after_ms = ((now_ms // 60000) + 1) * 60000
         state.pending_signal_until = time.time() + self.config.signal_recross_wait_seconds
         logging.info(
-            "%s reversal confirmed side=%s; waiting signal-price recross signal_price=%s "
-            "required_polls=%s wait_until=%s",
+            "%s reversal confirmed side=%s; waiting closed 1m signal-price recross signal_price=%s "
+            "first_eligible_candle_open=%s wait_until=%s",
             state.symbol,
             side,
             state.pending_signal_price,
-            self.config.signal_recross_confirm_polls,
+            datetime.fromtimestamp(state.pending_recross_candle_open_after_ms / 1000, self.tz).isoformat(),
             datetime.fromtimestamp(state.pending_signal_until, self.tz).isoformat(),
         )
         return self.signal_recross_ready(state, side, mark_price)
@@ -1369,24 +1428,45 @@ class BnStraHighRisk1:
     def signal_recross_ready(
         self, state: PositionState, side: str, mark_price: Decimal
     ) -> bool:
+        candles = self.fetch_closed_candles(state.symbol, "1m", 3)
+        eligible = [
+            candle
+            for candle in candles
+            if candle.open_time >= state.pending_recross_candle_open_after_ms
+        ]
+        if not eligible:
+            logging.info(
+                "%s waiting closed 1m signal-price recross side=%s signal_price=%s first_eligible_open=%s",
+                state.symbol,
+                side,
+                state.pending_signal_price,
+                datetime.fromtimestamp(state.pending_recross_candle_open_after_ms / 1000, self.tz).isoformat(),
+            )
+            return False
+        candle = eligible[-1]
         crossed = (
+            candle.close >= state.pending_signal_price
+            if side == "long"
+            else candle.close <= state.pending_signal_price
+        )
+        logging.info(
+            "%s closed 1m signal-price recross side=%s candle_open=%s close=%s signal_price=%s "
+            "crossed=%s current_mark=%s",
+            state.symbol,
+            side,
+            datetime.fromtimestamp(candle.open_time / 1000, self.tz).isoformat(),
+            candle.close,
+            state.pending_signal_price,
+            crossed,
+            mark_price,
+        )
+        if not crossed:
+            return False
+        return (
             mark_price >= state.pending_signal_price
             if side == "long"
             else mark_price <= state.pending_signal_price
         )
-        state.pending_recross_count = state.pending_recross_count + 1 if crossed else 0
-        logging.info(
-            "%s waiting signal-price recross side=%s mark=%s signal_price=%s crossed=%s "
-            "confirmations=%s/%s",
-            state.symbol,
-            side,
-            mark_price,
-            state.pending_signal_price,
-            crossed,
-            state.pending_recross_count,
-            self.config.signal_recross_confirm_polls,
-        )
-        return state.pending_recross_count >= self.config.signal_recross_confirm_polls
 
     def clear_pending_signal(self, state: PositionState) -> None:
         state.pending_signal_side = None
@@ -1397,6 +1477,7 @@ class BnStraHighRisk1:
         state.pending_pullback_extreme = Decimal("0")
         state.pending_reversal_confirmed = False
         state.pending_recross_count = 0
+        state.pending_recross_candle_open_after_ms = 0
 
     def was_stop_order_filled(self, state: PositionState) -> bool:
         if self.config.dry_run or not state.stop_client_id:
@@ -1467,9 +1548,9 @@ class BnStraHighRisk1:
                 "Switch USD-M Futures position mode to One-way before running."
             )
 
-    def fetch_candles(self, symbol: str) -> list[Candle]:
+    def fetch_closed_candles(self, symbol: str, interval: str, limit: int) -> list[Candle]:
         rows = self.client.public_request(
-            "GET", "/fapi/v1/klines", {"symbol": symbol, "interval": self.config.interval, "limit": self.config.kline_limit}
+            "GET", "/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit}
         )
         candles = [
             Candle(
@@ -1484,6 +1565,9 @@ class BnStraHighRisk1:
         ]
         now_ms = int(time.time() * 1000)
         return [candle for candle in candles if candle.close_time < now_ms]
+
+    def fetch_candles(self, symbol: str) -> list[Candle]:
+        return self.fetch_closed_candles(symbol, self.config.interval, self.config.kline_limit)
 
     def get_mark_price(self, symbol: str) -> Decimal:
         data = self.client.public_request("GET", "/fapi/v1/premiumIndex", {"symbol": symbol})
@@ -2051,6 +2135,27 @@ def entry_near_ema(
         return False
     atr_value = atr_pct * close
     return abs(close - ema) <= atr_value * max_atr_distance
+
+
+def adverse_entry_signal_distance(entry_price: Decimal, signal_price: Decimal, side: str) -> Decimal:
+    if signal_price <= 0:
+        return Decimal("999")
+    adverse_distance = (
+        entry_price - signal_price if side == "long" else signal_price - entry_price
+    )
+    return max(Decimal("0"), adverse_distance / signal_price)
+
+
+def entry_signal_price_allows(
+    entry_price: Decimal,
+    signal_price: Decimal,
+    side: str,
+    max_distance_pct: Decimal,
+) -> bool:
+    still_crossed = entry_price >= signal_price if side == "long" else entry_price <= signal_price
+    return still_crossed and adverse_entry_signal_distance(
+        entry_price, signal_price, side
+    ) <= max_distance_pct
 
 
 def contract_position_allows(

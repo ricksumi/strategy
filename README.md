@@ -59,9 +59,12 @@ Short pullback: current price >= signal close * 1.004
 Long confirmation: price rebounds by max(0.4%, ATR percentage * 0.15) from the pullback low
 Short confirmation: price falls by max(0.4%, ATR percentage * 0.15) from the pullback high
 Signal window: 300 seconds
-Long recross: mark price returns to or above the original signal close after reversal confirmation
-Short recross: mark price returns to or below the original signal close after reversal confirmation
-Recross stability: 2 consecutive polls within a separate 180-second window
+Long recross: a complete 1-minute candle formed after reversal confirmation closes at or above the original signal close
+Short recross: a complete 1-minute candle formed after reversal confirmation closes at or below the original signal close
+The current mark price must remain on the confirmed side when the entry is evaluated
+Maximum adverse entry distance from the original signal = min(0.3%, ATR percentage * 0.25)
+Invalidate the signal instead of chasing when the entry distance exceeds that limit
+Closed-candle confirmation window: 180 seconds
 Invalidate the current signal when adverse pullback exceeds 1.5 ATR
 Entry order: LIMIT IOC capped at 0.20% beyond the latest confirmation mark price
 ```
@@ -116,7 +119,7 @@ Stop trigger source: MARK_PRICE
 
 Only an initial protective stop that Binance confirms as triggered or finished increments the stop counters. Manual closes, unconfirmed closes, breakeven exits, and trailing-stop exits do not count. The sixth confirmed initial stop pauses real entries until the next Asia/Shanghai day while existing positions continue to be protected and managed. A Hermes notification is sent once when the limit is exceeded. The global count and notification state are persisted and the count is reconstructed from per-symbol counts when an older state file is loaded.
 
-When `paper_signals_after_global_stop` is enabled, the bot continues evaluating the complete entry pipeline after the global limit pauses real orders. Qualified entries become clearly labeled paper positions using the configured fixed margin and leverage. Paper positions follow the same stop cap, partial exits, profit lock, and trailing-stop tiers. They survive service restarts and produce only `PAPER OPEN - NO REAL ORDER` and `PAPER CLOSED - NO REAL ORDER` Hermes messages. Estimated paper PnL includes configured trading commissions but treats funding as zero. No Binance order is submitted for a paper position.
+When `paper_trading_only` is enabled, every qualified entry becomes a clearly labeled paper position and no Binance entry order is submitted, regardless of daily stop counters or day changes. `paper_signals_after_global_stop` provides the narrower fallback mode when live trading is enabled but the global limit has paused real orders. Paper positions use the configured fixed margin and leverage and follow the same stop cap, partial exits, profit lock, and trailing-stop tiers. They survive service restarts and produce only `PAPER OPEN - NO REAL ORDER` and `PAPER CLOSED - NO REAL ORDER` Hermes messages. Estimated paper PnL includes configured trading commissions but treats funding as zero.
 
 ## Hermes notifications
 
