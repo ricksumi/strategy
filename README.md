@@ -105,14 +105,14 @@ ATR above 6% blocks new entries; ATR within the allowed range does not change po
 
 ```text
 high_vol mode: maximum 2 initial stop losses per symbol per day
-Global limit: maximum 5 initial stop losses across all symbols per Asia/Shanghai day
+Global limit: pause new entries after more than 5 confirmed initial stop losses across all symbols per Asia/Shanghai day
 Concurrent exposure: maximum 3 open positions
 Cooldown after any position closes: 30 minutes
 Position mode: one-way mode with positionSide=BOTH
 Stop trigger source: MARK_PRICE
 ```
 
-Breakeven and trailing-stop exits do not increment either initial-stop counter. Once the global limit is reached, new entries pause until the next Asia/Shanghai day while existing positions continue to be protected and managed. The global count is persisted and is reconstructed from per-symbol counts when an older state file is loaded.
+Only an initial protective stop that Binance confirms as triggered or finished increments the stop counters. Manual closes, unconfirmed closes, breakeven exits, and trailing-stop exits do not count. The sixth confirmed initial stop pauses new entries until the next Asia/Shanghai day while existing positions continue to be protected and managed. A Hermes notification is sent once when the limit is exceeded. The global count and notification state are persisted and the count is reconstructed from per-symbol counts when an older state file is loaded.
 
 ## Hermes notifications
 

@@ -382,6 +382,7 @@ class BnStraHighRisk1:
         self.global_daily_stop_day = datetime.now(self.tz).strftime("%Y-%m-%d")
         self.global_daily_stop_count = 0
         self.global_limit_logged = False
+        self.global_limit_notified = False
         self.position_limit_logged = False
         self.load_runtime_state()
 
@@ -507,15 +508,16 @@ class BnStraHighRisk1:
 
     def entry_limits_allow(self, state: PositionState) -> bool:
         if self.config.global_daily_stop_limit and (
-            self.global_daily_stop_count >= self.config.global_daily_stop_limit
+            self.global_daily_stop_count > self.config.global_daily_stop_limit
         ):
             if not self.global_limit_logged:
                 logging.warning(
-                    "Global daily stop limit reached: count=%s limit=%s; new entries paused until next day",
+                    "Global daily stop limit exceeded: count=%s limit=%s; new entries paused until next day",
                     self.global_daily_stop_count,
                     self.config.global_daily_stop_limit,
                 )
                 self.global_limit_logged = True
+            self.notify_global_daily_stop_limit()
             return False
 
         self.global_limit_logged = False
@@ -837,9 +839,6 @@ class BnStraHighRisk1:
             state.stop_reason,
         )
         stop_filled = self.was_stop_order_filled(state)
-        if not stop_filled and state.stop_reason == "stop_loss" and state.stop_client_id:
-            stop_filled = True
-            logging.info("%s stop order not confirmed yet; counting stop_loss conservatively", state.symbol)
         if stop_filled and state.stop_reason == "stop_loss":
             state.daily_stop_count += 1
             self.global_daily_stop_count += 1
@@ -852,26 +851,9 @@ class BnStraHighRisk1:
             )
             if (
                 self.config.global_daily_stop_limit
-                and self.global_daily_stop_count >= self.config.global_daily_stop_limit
-                and not self.global_limit_logged
+                and self.global_daily_stop_count > self.config.global_daily_stop_limit
             ):
-                self.global_limit_logged = True
-                logging.warning(
-                    "Global daily stop limit reached: count=%s limit=%s; new entries paused until next day",
-                    self.global_daily_stop_count,
-                    self.config.global_daily_stop_limit,
-                )
-                self.notifier.send(
-                    "\n".join(
-                        [
-                            "[GLOBAL DAILY STOP LIMIT]",
-                            f"- Stop losses today: {self.global_daily_stop_count}",
-                            f"- Limit: {self.config.global_daily_stop_limit}",
-                            "- New entries are paused until the next Asia/Shanghai day.",
-                            "- Existing positions remain protected and managed.",
-                        ]
-                    )
-                )
+                self.notify_global_daily_stop_limit()
         self.cancel_open_orders(state.symbol)
         self.cancel_algo_open_orders(state.symbol)
         self.notify_position_closed(state, close_opened_at_ms, close_margin)
@@ -893,6 +875,23 @@ class BnStraHighRisk1:
         state.cooldown_until = time.time() + self.config.cooldown_seconds
         self.save_runtime_state()
         logging.info("%s cooldown_until=%s", state.symbol, datetime.fromtimestamp(state.cooldown_until, self.tz).isoformat())
+
+    def notify_global_daily_stop_limit(self) -> None:
+        if self.global_limit_notified:
+            return
+        self.global_limit_notified = True
+        self.save_runtime_state()
+        self.notifier.send(
+            "\n".join(
+                [
+                    "[GLOBAL DAILY STOP LIMIT EXCEEDED]",
+                    f"- Confirmed initial stop losses: {self.global_daily_stop_count}",
+                    f"- Allowed before pause: {self.config.global_daily_stop_limit}",
+                    "- New entries are paused until the next Asia/Shanghai day.",
+                    "- Existing positions remain protected and managed.",
+                ]
+            )
+        )
 
     def notify_position_opened(self, state: PositionState) -> None:
         assert state.side is not None
@@ -1375,6 +1374,7 @@ class BnStraHighRisk1:
             self.global_daily_stop_day = today
             self.global_daily_stop_count = 0
             self.global_limit_logged = False
+            self.global_limit_notified = False
             changed = True
         if state.daily_stop_day != today:
             state.daily_stop_day = today
@@ -1402,8 +1402,10 @@ class BnStraHighRisk1:
                     if raw_global_count is not None
                     else sum(max(0, int(value)) for value in counts.values())
                 )
+                self.global_limit_notified = bool(data.get("global_limit_notified", False))
             else:
                 self.global_daily_stop_count = 0
+                self.global_limit_notified = False
             for symbol, state in self.states.items():
                 state.daily_stop_count = max(0, int(counts.get(symbol, 0)))
             cooldowns = data.get("cooldown_until", {})
@@ -1450,6 +1452,7 @@ class BnStraHighRisk1:
         data = {
             "day": today,
             "global_daily_stop_count": self.global_daily_stop_count,
+            "global_limit_notified": self.global_limit_notified,
             "daily_stop_counts": {
                 symbol: state.daily_stop_count
                 for symbol, state in self.states.items()

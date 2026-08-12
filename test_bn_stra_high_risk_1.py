@@ -420,10 +420,31 @@ class BnStraHighRisk1Tests(unittest.TestCase):
 
         self.assertEqual(client.calls[-1], ("DELETE", "/fapi/v1/algoOpenOrders", {"symbol": "ETHUSDT"}))
 
-    def test_stop_loss_count_uses_conservative_fallback(self):
+    def test_unconfirmed_stop_loss_does_not_increment_counts(self):
         with TemporaryDirectory() as tmpdir:
             state_file = Path(tmpdir) / "state.json"
             client = RecordingClient(algo_order_response={"algoStatus": "NEW"})
+            with patch.dict("os.environ", {"BN_STRA_STATE_FILE": str(state_file)}):
+                bot = BnStraHighRisk1(test_config(False), client)
+                state = PositionState(
+                    symbol="ETHUSDT",
+                    side="long",
+                    entry_price=Decimal("100"),
+                    quantity=Decimal("1"),
+                    stop_price=Decimal("98"),
+                    stop_client_id="cid",
+                    stop_reason="stop_loss",
+                )
+
+                bot.on_position_closed(state)
+
+        self.assertEqual(state.daily_stop_count, 0)
+        self.assertEqual(bot.global_daily_stop_count, 0)
+
+    def test_confirmed_initial_stop_increments_both_counts(self):
+        with TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            client = RecordingClient(algo_order_response={"algoStatus": "FINISHED"})
             with patch.dict("os.environ", {"BN_STRA_STATE_FILE": str(state_file)}):
                 bot = BnStraHighRisk1(test_config(False), client)
                 state = PositionState(
@@ -512,9 +533,32 @@ class BnStraHighRisk1Tests(unittest.TestCase):
     def test_global_daily_stop_limit_blocks_new_entries(self):
         config = replace(test_config(False), global_daily_stop_limit=5)
         bot = BnStraHighRisk1(config, FakeClient([]))
-        bot.global_daily_stop_count = 5
+        bot.global_daily_stop_count = 6
 
         self.assertFalse(bot.entry_limits_allow(bot.states["ETHUSDT"]))
+
+    def test_global_daily_stop_limit_allows_fifth_stop_count(self):
+        config = replace(test_config(False), global_daily_stop_limit=5)
+        bot = BnStraHighRisk1(config, FakeClient([]))
+        bot.global_daily_stop_count = 5
+
+        self.assertTrue(bot.entry_limits_allow(bot.states["ETHUSDT"]))
+
+    def test_global_daily_stop_notification_is_sent_once(self):
+        with TemporaryDirectory() as tmpdir, patch.dict(
+            "os.environ", {"BN_STRA_STATE_FILE": str(Path(tmpdir) / "state.json")}
+        ):
+            config = replace(test_config(False), global_daily_stop_limit=5)
+            bot = BnStraHighRisk1(config, FakeClient([]))
+            notifier = RecordingNotifier()
+            bot.notifier = notifier
+            bot.global_daily_stop_count = 6
+
+            self.assertFalse(bot.entry_limits_allow(bot.states["ETHUSDT"]))
+            self.assertFalse(bot.entry_limits_allow(bot.states["ETHUSDT"]))
+
+        self.assertEqual(len(notifier.messages), 1)
+        self.assertIn("[GLOBAL DAILY STOP LIMIT EXCEEDED]", notifier.messages[0])
 
     def test_concurrent_position_limit_blocks_new_entries(self):
         config = replace(
