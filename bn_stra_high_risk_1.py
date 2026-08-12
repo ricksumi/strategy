@@ -97,6 +97,7 @@ class BotConfig:
     hermes_enabled: bool = False
     hermes_socket_path: str = ""
     hermes_target: str = "weixin"
+    paper_signals_after_global_stop: bool = False
 
     @classmethod
     def from_file(cls, path: str) -> "BotConfig":
@@ -170,6 +171,7 @@ class BotConfig:
             hermes_enabled=bool(raw.get("hermes_enabled", False)),
             hermes_socket_path=str(raw.get("hermes_socket_path", "")),
             hermes_target=str(raw.get("hermes_target", "weixin")),
+            paper_signals_after_global_stop=bool(raw.get("paper_signals_after_global_stop", False)),
         )
 
     def validate(self) -> None:
@@ -295,6 +297,26 @@ class PositionState:
     last_insufficient_margin_notice: float = 0
 
 
+@dataclass
+class PaperPosition:
+    symbol: str
+    side: str
+    entry_price: Decimal
+    quantity: Decimal
+    remaining_quantity: Decimal
+    best_price: Decimal
+    stop_price: Decimal
+    stop_reason: str
+    opened_at_ms: int
+    initial_margin: Decimal
+    realized_gross_pnl: Decimal = Decimal("0")
+    commission: Decimal = Decimal("0")
+    partial_take_1_done: bool = False
+    partial_take_2_done: bool = False
+    breakeven_done: bool = False
+    trailing_active: bool = False
+
+
 class HermesNotifier:
     def __init__(self, enabled: bool, socket_path: str, target: str) -> None:
         self.enabled = enabled
@@ -388,6 +410,7 @@ class BnStraHighRisk1:
         self.global_limit_logged = False
         self.global_limit_notified = False
         self.position_limit_logged = False
+        self.paper_positions: dict[str, PaperPosition] = {}
         self.load_runtime_state()
 
     def run_forever(self) -> None:
@@ -434,7 +457,15 @@ class BnStraHighRisk1:
         if symbol not in self.config.symbols:
             return
 
-        if not self.entry_limits_allow(state):
+        paper_position = self.paper_positions.get(symbol)
+        if paper_position is not None:
+            self.manage_paper_position(paper_position, self.get_mark_price(symbol))
+            return
+
+        global_paused = self.global_entries_paused()
+        if global_paused:
+            self.log_and_notify_global_pause()
+        elif not self.entry_limits_allow(state):
             return
         if time.time() < state.cooldown_until:
             return
@@ -508,20 +539,30 @@ class BnStraHighRisk1:
             return
         base_stop_pct = self.config.stop_loss_roi / Decimal(self.config.leverage)
         stop_distance_pct = capped_atr_stop_distance(base_stop_pct, atr_pct, self.config.atr_stop_multiplier)
-        self.open_position(symbol, signal, stop_distance_pct)
+        if global_paused and self.config.paper_signals_after_global_stop:
+            self.open_paper_position(symbol, signal, stop_distance_pct)
+        elif not global_paused:
+            self.open_position(symbol, signal, stop_distance_pct)
+
+    def global_entries_paused(self) -> bool:
+        return bool(
+            self.config.global_daily_stop_limit
+            and self.global_daily_stop_count > self.config.global_daily_stop_limit
+        )
+
+    def log_and_notify_global_pause(self) -> None:
+        if not self.global_limit_logged:
+            logging.warning(
+                "Global daily stop limit exceeded: count=%s limit=%s; real entries paused until next day",
+                self.global_daily_stop_count,
+                self.config.global_daily_stop_limit,
+            )
+            self.global_limit_logged = True
+        self.notify_global_daily_stop_limit()
 
     def entry_limits_allow(self, state: PositionState) -> bool:
-        if self.config.global_daily_stop_limit and (
-            self.global_daily_stop_count > self.config.global_daily_stop_limit
-        ):
-            if not self.global_limit_logged:
-                logging.warning(
-                    "Global daily stop limit exceeded: count=%s limit=%s; new entries paused until next day",
-                    self.global_daily_stop_count,
-                    self.config.global_daily_stop_limit,
-                )
-                self.global_limit_logged = True
-            self.notify_global_daily_stop_limit()
+        if self.global_entries_paused():
+            self.log_and_notify_global_pause()
             return False
 
         self.global_limit_logged = False
@@ -665,6 +706,199 @@ class BnStraHighRisk1:
     def margin_per_symbol(self, equity: Decimal) -> Decimal:
         return self.config.margin_per_trade
 
+    def open_paper_position(self, symbol: str, side: str, stop_distance_pct: Decimal) -> None:
+        if symbol in self.paper_positions:
+            return
+        active_real_positions = sum(1 for state in self.states.values() if state.quantity != 0)
+        simulated_portfolio_size = active_real_positions + len(self.paper_positions)
+        if self.config.max_concurrent_positions and simulated_portfolio_size >= self.config.max_concurrent_positions:
+            logging.info(
+                "%s paper signal blocked: simulated position limit reached active=%s limit=%s",
+                symbol,
+                simulated_portfolio_size,
+                self.config.max_concurrent_positions,
+            )
+            self.clear_pending_signal(self.states[symbol])
+            return
+        entry_price = self.get_mark_price(symbol)
+        quantity = round_to_step(
+            (self.config.margin_per_trade * Decimal(self.config.leverage)) / entry_price,
+            self.rules[symbol].step_size,
+        )
+        if quantity < self.rules[symbol].min_qty:
+            logging.warning("%s paper quantity %s below minQty %s", symbol, quantity, self.rules[symbol].min_qty)
+            self.clear_pending_signal(self.states[symbol])
+            return
+        stop_price = round_stop_price(
+            stop_price_from_distance(entry_price, side, stop_distance_pct),
+            self.rules[symbol].tick_size,
+            side,
+        )
+        position = PaperPosition(
+            symbol=symbol,
+            side=side,
+            entry_price=entry_price,
+            quantity=quantity,
+            remaining_quantity=quantity,
+            best_price=entry_price,
+            stop_price=stop_price,
+            stop_reason="stop_loss",
+            opened_at_ms=int(time.time() * 1000),
+            initial_margin=entry_price * quantity / Decimal(self.config.leverage),
+            commission=entry_price * quantity * self.config.fee_rate,
+        )
+        self.paper_positions[symbol] = position
+        self.clear_pending_signal(self.states[symbol])
+        self.save_runtime_state()
+        logging.info(
+            "%s paper opened side=%s entry=%s qty=%s initial_stop=%s margin=%s",
+            symbol, side, entry_price, quantity, stop_price, position.initial_margin,
+        )
+        self.notify_paper_position_opened(position)
+
+    def manage_paper_position(self, position: PaperPosition, mark_price: Decimal) -> None:
+        stop_reached = (
+            mark_price <= position.stop_price if position.side == "long" else mark_price >= position.stop_price
+        )
+        if stop_reached:
+            self.close_paper_position(position, position.stop_price)
+            return
+
+        position.best_price = (
+            max(position.best_price, mark_price)
+            if position.side == "long"
+            else min(position.best_price, mark_price)
+        )
+        current_roi = margin_roi(mark_price, position.entry_price, position.side, self.config.leverage)
+        if current_roi >= self.config.partial_take_1_roi and not position.partial_take_1_done:
+            self.execute_paper_partial_take_profit(
+                position, 1, self.config.partial_take_1_fraction, mark_price
+            )
+        if current_roi >= self.config.partial_take_2_roi and not position.partial_take_2_done:
+            self.execute_paper_partial_take_profit(
+                position, 2, self.config.partial_take_2_fraction, mark_price
+            )
+
+        new_stop = position.stop_price
+        breakeven_trigger = profit_trigger_price(
+            position.entry_price, position.side, self.config.breakeven_roi, self.config.leverage
+        )
+        if reached_profit_trigger(mark_price, position.side, breakeven_trigger):
+            position.breakeven_done = True
+            new_stop = improve_stop(
+                new_stop,
+                profit_trigger_price(
+                    position.entry_price, position.side, self.config.profit_lock_roi, self.config.leverage
+                ),
+                position.side,
+            )
+
+        best_roi = margin_roi(position.best_price, position.entry_price, position.side, self.config.leverage)
+        callback = trailing_callback_for_roi(
+            best_roi,
+            self.config.trailing_activation_roi,
+            self.config.trailing_callback,
+            self.config.trailing_tier_2_roi,
+            self.config.trailing_tier_2_callback,
+            self.config.trailing_tier_3_roi,
+            self.config.trailing_tier_3_callback,
+        )
+        if callback is not None:
+            position.trailing_active = True
+            trailing_stop = (
+                position.best_price * (Decimal("1") - callback)
+                if position.side == "long"
+                else position.best_price * (Decimal("1") + callback)
+            )
+            new_stop = improve_stop(new_stop, trailing_stop, position.side)
+
+        new_stop = round_stop_price(new_stop, self.rules[position.symbol].tick_size, position.side)
+        if stop_improved_by(new_stop, position.stop_price, position.side, self.config.stop_update_min_pct):
+            old_stop = position.stop_price
+            position.stop_price = new_stop
+            if position.trailing_active:
+                position.stop_reason = "trailing_stop"
+            elif position.breakeven_done:
+                position.stop_reason = "break_even"
+            logging.info(
+                "%s paper stop moved side=%s mark=%s best=%s old_stop=%s new_stop=%s reason=%s",
+                position.symbol, position.side, mark_price, position.best_price, old_stop, new_stop,
+                position.stop_reason,
+            )
+        self.save_runtime_state()
+
+    def execute_paper_partial_take_profit(
+        self, position: PaperPosition, tier: int, fraction: Decimal, fill_price: Decimal
+    ) -> None:
+        target_qty = round_to_step(position.quantity * fraction, self.rules[position.symbol].step_size)
+        close_qty = min(position.remaining_quantity, target_qty)
+        if close_qty < self.rules[position.symbol].min_qty:
+            logging.warning(
+                "%s paper partial tier=%s quantity=%s below minQty", position.symbol, tier, close_qty
+            )
+            return
+        position.realized_gross_pnl += gross_pnl(
+            position.entry_price, fill_price, close_qty, position.side
+        )
+        position.commission += fill_price * close_qty * self.config.fee_rate
+        position.remaining_quantity -= close_qty
+        position.partial_take_1_done = position.partial_take_1_done or tier == 1
+        position.partial_take_2_done = position.partial_take_2_done or tier == 2
+        logging.info(
+            "%s paper partial take-profit tier=%s qty=%s fill=%s remaining=%s gross_pnl=%s",
+            position.symbol, tier, close_qty, fill_price, position.remaining_quantity,
+            position.realized_gross_pnl,
+        )
+
+    def close_paper_position(self, position: PaperPosition, fill_price: Decimal) -> None:
+        position.realized_gross_pnl += gross_pnl(
+            position.entry_price, fill_price, position.remaining_quantity, position.side
+        )
+        position.commission += fill_price * position.remaining_quantity * self.config.fee_rate
+        net_pnl = position.realized_gross_pnl - position.commission
+        duration = max(0, (int(time.time() * 1000) - position.opened_at_ms) // 1000)
+        roi = net_pnl / position.initial_margin * Decimal("100") if position.initial_margin > 0 else Decimal("0")
+        logging.info(
+            "%s paper closed side=%s reason=%s fill=%s gross=%s commission=%s net=%s roi=%s%%",
+            position.symbol, position.side, position.stop_reason, fill_price,
+            position.realized_gross_pnl, position.commission, net_pnl, roi,
+        )
+        self.notifier.send(
+            "\n".join(
+                [
+                    f"[PAPER CLOSED - NO REAL ORDER] {position.symbol} {position.side.upper()}",
+                    f"- Reason: {position.stop_reason}",
+                    f"- Entry: {format_decimal(position.entry_price)}",
+                    f"- Simulated exit: {format_decimal(fill_price)}",
+                    f"- Initial quantity: {format_decimal(position.quantity)}",
+                    f"- Estimated gross PnL: {position.realized_gross_pnl:+.4f} USDT",
+                    f"- Estimated commission: {-position.commission:+.4f} USDT",
+                    "- Estimated funding: +0.0000 USDT",
+                    f"- Estimated net PnL: {net_pnl:+.4f} USDT",
+                    f"- Simulated margin ROI: {roi:+.2f}%",
+                    f"- Duration: {duration // 3600}h {(duration % 3600) // 60}m {duration % 60}s",
+                ]
+            )
+        )
+        del self.paper_positions[position.symbol]
+        self.states[position.symbol].cooldown_until = time.time() + self.config.cooldown_seconds
+        self.save_runtime_state()
+
+    def notify_paper_position_opened(self, position: PaperPosition) -> None:
+        self.notifier.send(
+            "\n".join(
+                [
+                    f"[PAPER OPEN - NO REAL ORDER] {position.symbol} {position.side.upper()} {self.config.leverage}x",
+                    f"- Simulated entry: {format_decimal(position.entry_price)}",
+                    f"- Simulated quantity: {format_decimal(position.quantity)}",
+                    f"- Margin: {position.initial_margin:.4f} USDT",
+                    f"- Notional: {(position.entry_price * position.quantity):.4f} USDT",
+                    f"- Initial stop: {format_decimal(position.stop_price)}",
+                    "- This signal is tracked only because real entries are paused by the global daily stop limit.",
+                ]
+            )
+        )
+
     def manage_open_position(self, state: PositionState, mark_price: Decimal) -> None:
         assert state.side is not None
         if state.side == "long":
@@ -790,18 +1024,6 @@ class BnStraHighRisk1:
             "%s partial take-profit tier=%s qty=%s fill=%s remaining=%s estimated_gross_pnl=%s",
             state.symbol, tier, close_qty, fill_price, state.quantity, realized_estimate,
         )
-        self.notifier.send(
-            "\n".join(
-                [
-                    f"[PARTIAL TAKE PROFIT] {state.symbol} {(state.side or 'unknown').upper()}",
-                    f"- Tier: {tier}",
-                    f"- Closed quantity: {format_decimal(close_qty)}",
-                    f"- Fill price: {format_decimal(fill_price)}",
-                    f"- Remaining quantity: {format_decimal(state.quantity)}",
-                    f"- Estimated gross PnL: {realized_estimate:+.4f} USDT",
-                ]
-            )
-        )
 
     def replace_stop_order(self, state: PositionState, new_stop: Decimal) -> None:
         order = self.place_stop_order(state.symbol, state.side or "long", state.quantity, new_stop, "managed")
@@ -921,6 +1143,7 @@ class BnStraHighRisk1:
                     f"- Allowed before pause: {self.config.global_daily_stop_limit}",
                     "- New entries are paused until the next Asia/Shanghai day.",
                     "- Existing positions remain protected and managed.",
+                    "- Qualified signals will be tracked as paper trades when enabled.",
                 ]
             )
         )
@@ -1493,6 +1716,30 @@ class BnStraHighRisk1:
                 state.stop_reason = str(raw_trade.get("stop_reason", "stop_loss"))
                 state.breakeven_done = bool(raw_trade.get("breakeven_done", False))
                 state.trailing_active = bool(raw_trade.get("trailing_active", False))
+            paper_positions = data.get("paper_positions", {})
+            if not isinstance(paper_positions, dict):
+                raise ValueError("paper_positions must be an object")
+            for symbol, raw_position in paper_positions.items():
+                if not isinstance(raw_position, dict) or symbol not in self.states:
+                    continue
+                self.paper_positions[symbol] = PaperPosition(
+                    symbol=symbol,
+                    side=str(raw_position["side"]),
+                    entry_price=Decimal(str(raw_position["entry_price"])),
+                    quantity=Decimal(str(raw_position["quantity"])),
+                    remaining_quantity=Decimal(str(raw_position["remaining_quantity"])),
+                    best_price=Decimal(str(raw_position["best_price"])),
+                    stop_price=Decimal(str(raw_position["stop_price"])),
+                    stop_reason=str(raw_position.get("stop_reason", "stop_loss")),
+                    opened_at_ms=int(raw_position["opened_at_ms"]),
+                    initial_margin=Decimal(str(raw_position["initial_margin"])),
+                    realized_gross_pnl=Decimal(str(raw_position.get("realized_gross_pnl", "0"))),
+                    commission=Decimal(str(raw_position.get("commission", "0"))),
+                    partial_take_1_done=bool(raw_position.get("partial_take_1_done", False)),
+                    partial_take_2_done=bool(raw_position.get("partial_take_2_done", False)),
+                    breakeven_done=bool(raw_position.get("breakeven_done", False)),
+                    trailing_active=bool(raw_position.get("trailing_active", False)),
+                )
             logging.info(
                 "Restored daily stop counts for %s: per_symbol=%s global=%s",
                 today,
@@ -1535,6 +1782,26 @@ class BnStraHighRisk1:
                 }
                 for symbol, state in self.states.items()
                 if state.opened_at_ms > 0
+            },
+            "paper_positions": {
+                symbol: {
+                    "side": position.side,
+                    "entry_price": format_decimal(position.entry_price),
+                    "quantity": format_decimal(position.quantity),
+                    "remaining_quantity": format_decimal(position.remaining_quantity),
+                    "best_price": format_decimal(position.best_price),
+                    "stop_price": format_decimal(position.stop_price),
+                    "stop_reason": position.stop_reason,
+                    "opened_at_ms": position.opened_at_ms,
+                    "initial_margin": format_decimal(position.initial_margin),
+                    "realized_gross_pnl": format_decimal(position.realized_gross_pnl),
+                    "commission": format_decimal(position.commission),
+                    "partial_take_1_done": position.partial_take_1_done,
+                    "partial_take_2_done": position.partial_take_2_done,
+                    "breakeven_done": position.breakeven_done,
+                    "trailing_active": position.trailing_active,
+                }
+                for symbol, position in self.paper_positions.items()
             },
         }
         temp_path = self.state_path.with_name(f"{self.state_path.name}.tmp")
@@ -1815,6 +2082,11 @@ def round_stop_price(price: Decimal, tick_size: Decimal, side: str) -> Decimal:
 
 def round_to_step(value: Decimal, step_size: Decimal) -> Decimal:
     return (value / step_size).to_integral_value(rounding=ROUND_DOWN) * step_size
+
+
+def gross_pnl(entry_price: Decimal, exit_price: Decimal, quantity: Decimal, side: str) -> Decimal:
+    price_change = exit_price - entry_price if side == "long" else entry_price - exit_price
+    return price_change * quantity
 
 
 def format_decimal(value: Decimal) -> str:

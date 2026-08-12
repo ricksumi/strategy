@@ -114,11 +114,13 @@ Position mode: one-way mode with positionSide=BOTH
 Stop trigger source: MARK_PRICE
 ```
 
-Only an initial protective stop that Binance confirms as triggered or finished increments the stop counters. Manual closes, unconfirmed closes, breakeven exits, and trailing-stop exits do not count. The sixth confirmed initial stop pauses new entries until the next Asia/Shanghai day while existing positions continue to be protected and managed. A Hermes notification is sent once when the limit is exceeded. The global count and notification state are persisted and the count is reconstructed from per-symbol counts when an older state file is loaded.
+Only an initial protective stop that Binance confirms as triggered or finished increments the stop counters. Manual closes, unconfirmed closes, breakeven exits, and trailing-stop exits do not count. The sixth confirmed initial stop pauses real entries until the next Asia/Shanghai day while existing positions continue to be protected and managed. A Hermes notification is sent once when the limit is exceeded. The global count and notification state are persisted and the count is reconstructed from per-symbol counts when an older state file is loaded.
+
+When `paper_signals_after_global_stop` is enabled, the bot continues evaluating the complete entry pipeline after the global limit pauses real orders. Qualified entries become clearly labeled paper positions using the configured fixed margin and leverage. Paper positions follow the same stop cap, partial exits, profit lock, and trailing-stop tiers. They survive service restarts and produce only `PAPER OPEN - NO REAL ORDER` and `PAPER CLOSED - NO REAL ORDER` Hermes messages. Estimated paper PnL includes configured trading commissions but treats funding as zero. No Binance order is submitted for a paper position.
 
 ## Hermes notifications
 
-The bot can enqueue open and close notifications through a local `hermes-work` Unix socket. Open notifications include position sizing and protection levels. Close notifications query Binance income history and report realized PnL, commission, funding, net PnL, margin ROI, and holding duration.
+The bot can enqueue open and close notifications through a local `hermes-work` Unix socket. Open notifications include position sizing and protection levels. Close notifications query Binance income history and report realized PnL, commission, funding, net PnL, margin ROI, and holding duration. Partial take-profit executions remain in the service log and do not generate Hermes messages.
 
 ```json
 "hermes_enabled": true,

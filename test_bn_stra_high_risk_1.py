@@ -418,6 +418,8 @@ class BnStraHighRisk1Tests(unittest.TestCase):
             state.stop_order_id = 99
             state.stop_client_id = "initial"
             state.opened_at_ms = 1
+            notifier = RecordingNotifier()
+            bot.notifier = notifier
 
             bot.manage_open_position(state, Decimal("102.4"))
 
@@ -425,6 +427,63 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         self.assertTrue(state.partial_take_1_done)
         self.assertTrue(state.breakeven_done)
         self.assertEqual(state.stop_price, Decimal("101"))
+        self.assertEqual(notifier.messages, [])
+
+    def test_paper_position_tracks_partial_profit_and_sends_only_open_and_close(self):
+        with TemporaryDirectory() as tmpdir, patch.dict(
+            "os.environ", {"BN_STRA_STATE_FILE": str(Path(tmpdir) / "state.json")}
+        ):
+            config = replace(
+                test_config(False),
+                global_daily_stop_limit=5,
+                paper_signals_after_global_stop=True,
+                profit_lock_roi=Decimal("0.05"),
+            )
+            bot = BnStraHighRisk1(config, FakeClient([]))
+            bot.rules = {
+                "ETHUSDT": SymbolRules(
+                    tick_size=Decimal("0.01"), step_size=Decimal("1"), min_qty=Decimal("1")
+                )
+            }
+            notifier = RecordingNotifier()
+            bot.notifier = notifier
+            bot.get_mark_price = lambda symbol: Decimal("100")
+
+            bot.open_paper_position("ETHUSDT", "long", Decimal("0.02"))
+            self.assertEqual(len(notifier.messages), 1)
+            self.assertIn("[PAPER OPEN - NO REAL ORDER]", notifier.messages[0])
+            self.assertEqual(bot.paper_positions["ETHUSDT"].quantity, Decimal("10"))
+
+            bot.manage_paper_position(bot.paper_positions["ETHUSDT"], Decimal("102.4"))
+            self.assertEqual(len(notifier.messages), 1)
+            self.assertEqual(bot.paper_positions["ETHUSDT"].remaining_quantity, Decimal("7"))
+            self.assertEqual(bot.paper_positions["ETHUSDT"].stop_price, Decimal("101"))
+
+            bot.manage_paper_position(bot.paper_positions["ETHUSDT"], Decimal("100.5"))
+            self.assertNotIn("ETHUSDT", bot.paper_positions)
+            self.assertEqual(len(notifier.messages), 2)
+            self.assertIn("[PAPER CLOSED - NO REAL ORDER]", notifier.messages[1])
+            self.assertIn("Estimated net PnL: +13.3943 USDT", notifier.messages[1])
+
+    def test_paper_position_survives_restart(self):
+        with TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            config = replace(test_config(False), paper_signals_after_global_stop=True)
+            with patch.dict("os.environ", {"BN_STRA_STATE_FILE": str(state_file)}):
+                first = BnStraHighRisk1(config, FakeClient([]))
+                first.rules = {
+                    "ETHUSDT": SymbolRules(
+                        tick_size=Decimal("0.01"), step_size=Decimal("1"), min_qty=Decimal("1")
+                    )
+                }
+                first.get_mark_price = lambda symbol: Decimal("100")
+                first.open_paper_position("ETHUSDT", "short", Decimal("0.02"))
+                second = BnStraHighRisk1(config, FakeClient([]))
+
+            restored = second.paper_positions["ETHUSDT"]
+            self.assertEqual(restored.side, "short")
+            self.assertEqual(restored.entry_price, Decimal("100"))
+            self.assertEqual(restored.stop_price, Decimal("102"))
 
     def test_replace_stop_order_places_new_protection_before_canceling_old(self):
         client = RecordingClient()
