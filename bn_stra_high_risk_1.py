@@ -55,6 +55,9 @@ class BotConfig:
     pullback_entry_pct: Decimal
     pullback_confirm_pct: Decimal
     pullback_signal_wait_seconds: int
+    require_signal_recross: bool
+    signal_recross_wait_seconds: int
+    signal_recross_confirm_polls: int
     ema_fast: int
     ema_slow: int
     adx_period: int
@@ -79,6 +82,8 @@ class BotConfig:
     top_short_veto_min: Decimal
     stop_update_min_pct: Decimal
     daily_stop_limit: int
+    global_daily_stop_limit: int
+    max_concurrent_positions: int
     cooldown_seconds: int
     poll_seconds: int
     kline_limit: int
@@ -120,6 +125,9 @@ class BotConfig:
             pullback_entry_pct=Decimal(str(raw.get("pullback_entry_pct", "0"))),
             pullback_confirm_pct=Decimal(str(raw.get("pullback_confirm_pct", "0"))),
             pullback_signal_wait_seconds=int(raw.get("pullback_signal_wait_seconds", 0)),
+            require_signal_recross=bool(raw.get("require_signal_recross", False)),
+            signal_recross_wait_seconds=int(raw.get("signal_recross_wait_seconds", 180)),
+            signal_recross_confirm_polls=int(raw.get("signal_recross_confirm_polls", 2)),
             ema_fast=int(raw.get("ema_fast", 20)),
             ema_slow=int(raw.get("ema_slow", 60)),
             adx_period=int(raw.get("adx_period", 14)),
@@ -144,6 +152,8 @@ class BotConfig:
             top_short_veto_min=Decimal(str(raw.get("top_short_veto_min", "1.25"))),
             stop_update_min_pct=Decimal(str(raw.get("stop_update_min_pct", "0.002"))),
             daily_stop_limit=int(raw.get("daily_stop_limit", 3)),
+            global_daily_stop_limit=int(raw.get("global_daily_stop_limit", 0)),
+            max_concurrent_positions=int(raw.get("max_concurrent_positions", 0)),
             cooldown_seconds=int(raw.get("cooldown_seconds", 600)),
             poll_seconds=int(raw.get("poll_seconds", 15)),
             kline_limit=int(raw.get("kline_limit", 200)),
@@ -195,6 +205,10 @@ class BotConfig:
             raise ValueError("pullback_confirm_pct cannot be negative")
         if self.pullback_signal_wait_seconds < 0:
             raise ValueError("pullback_signal_wait_seconds cannot be negative")
+        if self.signal_recross_wait_seconds <= 0:
+            raise ValueError("signal_recross_wait_seconds must be positive")
+        if self.signal_recross_confirm_polls <= 0:
+            raise ValueError("signal_recross_confirm_polls must be positive")
         if self.atr_period <= 0:
             raise ValueError("atr_period must be positive")
         if self.atr_min_pct < 0 or self.atr_max_pct < 0:
@@ -211,6 +225,12 @@ class BotConfig:
             raise ValueError("atr_stop_multiplier must be positive")
         if self.stop_update_min_pct < 0:
             raise ValueError("stop_update_min_pct cannot be negative")
+        if self.daily_stop_limit <= 0:
+            raise ValueError("daily_stop_limit must be positive")
+        if self.global_daily_stop_limit < 0:
+            raise ValueError("global_daily_stop_limit cannot be negative")
+        if self.max_concurrent_positions < 0:
+            raise ValueError("max_concurrent_positions cannot be negative")
         if self.working_type not in {"MARK_PRICE", "CONTRACT_PRICE"}:
             raise ValueError("working_type must be MARK_PRICE or CONTRACT_PRICE")
         if self.position_side != "BOTH":
@@ -255,6 +275,8 @@ class PositionState:
     pending_confirm_pct: Decimal = Decimal("0")
     pending_pullback_reached: bool = False
     pending_pullback_extreme: Decimal = Decimal("0")
+    pending_reversal_confirmed: bool = False
+    pending_recross_count: int = 0
     rejected_signal_side: str | None = None
     rejected_signal_price: Decimal = Decimal("0")
     cooldown_until: float = 0
@@ -357,6 +379,10 @@ class BnStraHighRisk1:
             config.hermes_socket_path,
             config.hermes_target,
         )
+        self.global_daily_stop_day = datetime.now(self.tz).strftime("%Y-%m-%d")
+        self.global_daily_stop_count = 0
+        self.global_limit_logged = False
+        self.position_limit_logged = False
         self.load_runtime_state()
 
     def run_forever(self) -> None:
@@ -403,10 +429,7 @@ class BnStraHighRisk1:
         if symbol not in self.config.symbols:
             return
 
-        if state.daily_stop_count >= self.config.daily_stop_limit:
-            if not state.daily_limit_logged:
-                logging.info("%s daily stop limit reached: %s", symbol, state.daily_stop_count)
-                state.daily_limit_logged = True
+        if not self.entry_limits_allow(state):
             return
         if time.time() < state.cooldown_until:
             return
@@ -482,12 +505,49 @@ class BnStraHighRisk1:
         stop_distance_pct = capped_atr_stop_distance(base_stop_pct, atr_pct, self.config.atr_stop_multiplier)
         self.open_position(symbol, signal, stop_distance_pct)
 
+    def entry_limits_allow(self, state: PositionState) -> bool:
+        if self.config.global_daily_stop_limit and (
+            self.global_daily_stop_count >= self.config.global_daily_stop_limit
+        ):
+            if not self.global_limit_logged:
+                logging.warning(
+                    "Global daily stop limit reached: count=%s limit=%s; new entries paused until next day",
+                    self.global_daily_stop_count,
+                    self.config.global_daily_stop_limit,
+                )
+                self.global_limit_logged = True
+            return False
+
+        self.global_limit_logged = False
+        if state.daily_stop_count >= self.config.daily_stop_limit:
+            if not state.daily_limit_logged:
+                logging.info("%s daily stop limit reached: %s", state.symbol, state.daily_stop_count)
+                state.daily_limit_logged = True
+            return False
+
+        active_count = sum(1 for item in self.states.values() if item.quantity != 0)
+        if self.config.max_concurrent_positions and active_count >= self.config.max_concurrent_positions:
+            if not self.position_limit_logged:
+                logging.info(
+                    "Concurrent position limit reached: active=%s limit=%s",
+                    active_count,
+                    self.config.max_concurrent_positions,
+                )
+                self.position_limit_logged = True
+            return False
+
+        self.position_limit_logged = False
+        return True
+
     def open_position(
         self,
         symbol: str,
         side: str,
         stop_distance_pct: Decimal | None = None,
     ) -> None:
+        if not self.entry_limits_allow(self.states[symbol]):
+            self.clear_pending_signal(self.states[symbol])
+            return
         equity, available_balance = self.get_usdt_account_balances()
         margin = self.config.margin_per_trade
         required_available = margin * (Decimal("1") + self.config.fee_rate * Decimal(self.config.leverage))
@@ -782,8 +842,36 @@ class BnStraHighRisk1:
             logging.info("%s stop order not confirmed yet; counting stop_loss conservatively", state.symbol)
         if stop_filled and state.stop_reason == "stop_loss":
             state.daily_stop_count += 1
+            self.global_daily_stop_count += 1
             self.save_runtime_state()
-            logging.info("%s stop count today=%s", state.symbol, state.daily_stop_count)
+            logging.info(
+                "%s stop count today=%s global_stop_count=%s",
+                state.symbol,
+                state.daily_stop_count,
+                self.global_daily_stop_count,
+            )
+            if (
+                self.config.global_daily_stop_limit
+                and self.global_daily_stop_count >= self.config.global_daily_stop_limit
+                and not self.global_limit_logged
+            ):
+                self.global_limit_logged = True
+                logging.warning(
+                    "Global daily stop limit reached: count=%s limit=%s; new entries paused until next day",
+                    self.global_daily_stop_count,
+                    self.config.global_daily_stop_limit,
+                )
+                self.notifier.send(
+                    "\n".join(
+                        [
+                            "[GLOBAL DAILY STOP LIMIT]",
+                            f"- Stop losses today: {self.global_daily_stop_count}",
+                            f"- Limit: {self.config.global_daily_stop_limit}",
+                            "- New entries are paused until the next Asia/Shanghai day.",
+                            "- Existing positions remain protected and managed.",
+                        ]
+                    )
+                )
         self.cancel_open_orders(state.symbol)
         self.cancel_algo_open_orders(state.symbol)
         self.notify_position_closed(state, close_opened_at_ms, close_margin)
@@ -890,6 +978,22 @@ class BnStraHighRisk1:
 
         confirm_pct = self.config.pullback_confirm_pct if confirm_pct is None else confirm_pct
         now = time.time()
+        if (
+            state.pending_signal_side == side
+            and state.pending_reversal_confirmed
+            and now >= state.pending_signal_until
+        ):
+            rejected_price = state.pending_signal_price
+            state.rejected_signal_side = side
+            state.rejected_signal_price = rejected_price
+            logging.info(
+                "%s signal=%s invalidated: signal-price recross window expired signal_price=%s",
+                state.symbol,
+                side,
+                rejected_price,
+            )
+            self.clear_pending_signal(state)
+            return False
         if state.pending_signal_side != side or now >= state.pending_signal_until:
             state.pending_signal_side = side
             state.pending_signal_price = signal_price
@@ -897,6 +1001,8 @@ class BnStraHighRisk1:
             state.pending_confirm_pct = confirm_pct
             state.pending_pullback_reached = False
             state.pending_pullback_extreme = Decimal("0")
+            state.pending_reversal_confirmed = False
+            state.pending_recross_count = 0
             target = pullback_target_price(signal_price, side, self.config.pullback_entry_pct)
             logging.info(
                 "%s signal=%s waiting pullback signal_price=%s target=%s confirm_pct=%s wait_until=%s",
@@ -927,6 +1033,10 @@ class BnStraHighRisk1:
             )
             self.clear_pending_signal(state)
             return False
+
+        if state.pending_reversal_confirmed:
+            return self.signal_recross_ready(state, side, mark_price)
+
         target = pullback_target_price(state.pending_signal_price, side, self.config.pullback_entry_pct)
         if not state.pending_pullback_reached:
             if not pullback_entry_allowed(mark_price, side, state.pending_signal_price, self.config.pullback_entry_pct):
@@ -951,7 +1061,7 @@ class BnStraHighRisk1:
                 state.pending_confirm_pct,
             )
             if state.pending_confirm_pct <= 0:
-                return True
+                return self.on_pullback_reversal_confirmed(state, side, mark_price)
             return False
 
         if side == "long":
@@ -970,7 +1080,7 @@ class BnStraHighRisk1:
                 state.pending_signal_price,
                 target,
             )
-            return True
+            return self.on_pullback_reversal_confirmed(state, side, mark_price)
         logging.info(
             "%s waiting pullback reversal side=%s mark=%s extreme=%s confirmation=%s signal_price=%s target=%s",
             state.symbol,
@@ -983,6 +1093,47 @@ class BnStraHighRisk1:
         )
         return False
 
+    def on_pullback_reversal_confirmed(
+        self, state: PositionState, side: str, mark_price: Decimal
+    ) -> bool:
+        if not self.config.require_signal_recross:
+            return True
+        state.pending_reversal_confirmed = True
+        state.pending_recross_count = 0
+        state.pending_signal_until = time.time() + self.config.signal_recross_wait_seconds
+        logging.info(
+            "%s reversal confirmed side=%s; waiting signal-price recross signal_price=%s "
+            "required_polls=%s wait_until=%s",
+            state.symbol,
+            side,
+            state.pending_signal_price,
+            self.config.signal_recross_confirm_polls,
+            datetime.fromtimestamp(state.pending_signal_until, self.tz).isoformat(),
+        )
+        return self.signal_recross_ready(state, side, mark_price)
+
+    def signal_recross_ready(
+        self, state: PositionState, side: str, mark_price: Decimal
+    ) -> bool:
+        crossed = (
+            mark_price >= state.pending_signal_price
+            if side == "long"
+            else mark_price <= state.pending_signal_price
+        )
+        state.pending_recross_count = state.pending_recross_count + 1 if crossed else 0
+        logging.info(
+            "%s waiting signal-price recross side=%s mark=%s signal_price=%s crossed=%s "
+            "confirmations=%s/%s",
+            state.symbol,
+            side,
+            mark_price,
+            state.pending_signal_price,
+            crossed,
+            state.pending_recross_count,
+            self.config.signal_recross_confirm_polls,
+        )
+        return state.pending_recross_count >= self.config.signal_recross_confirm_polls
+
     def clear_pending_signal(self, state: PositionState) -> None:
         state.pending_signal_side = None
         state.pending_signal_price = Decimal("0")
@@ -990,6 +1141,8 @@ class BnStraHighRisk1:
         state.pending_confirm_pct = Decimal("0")
         state.pending_pullback_reached = False
         state.pending_pullback_extreme = Decimal("0")
+        state.pending_reversal_confirmed = False
+        state.pending_recross_count = 0
 
     def was_stop_order_filled(self, state: PositionState) -> bool:
         if self.config.dry_run or not state.stop_client_id:
@@ -1217,10 +1370,18 @@ class BnStraHighRisk1:
 
     def reset_daily_counter_if_needed(self, state: PositionState) -> None:
         today = datetime.now(self.tz).strftime("%Y-%m-%d")
+        changed = False
+        if self.global_daily_stop_day != today:
+            self.global_daily_stop_day = today
+            self.global_daily_stop_count = 0
+            self.global_limit_logged = False
+            changed = True
         if state.daily_stop_day != today:
             state.daily_stop_day = today
             state.daily_stop_count = 0
             state.daily_limit_logged = False
+            changed = True
+        if changed:
             self.save_runtime_state()
 
     def load_runtime_state(self) -> None:
@@ -1234,6 +1395,15 @@ class BnStraHighRisk1:
             counts = data.get("daily_stop_counts", {}) if data.get("day") == today else {}
             if not isinstance(counts, dict):
                 raise ValueError("daily_stop_counts must be an object")
+            if data.get("day") == today:
+                raw_global_count = data.get("global_daily_stop_count")
+                self.global_daily_stop_count = (
+                    max(0, int(raw_global_count))
+                    if raw_global_count is not None
+                    else sum(max(0, int(value)) for value in counts.values())
+                )
+            else:
+                self.global_daily_stop_count = 0
             for symbol, state in self.states.items():
                 state.daily_stop_count = max(0, int(counts.get(symbol, 0)))
             cooldowns = data.get("cooldown_until", {})
@@ -1266,7 +1436,12 @@ class BnStraHighRisk1:
                 state.stop_reason = str(raw_trade.get("stop_reason", "stop_loss"))
                 state.breakeven_done = bool(raw_trade.get("breakeven_done", False))
                 state.trailing_active = bool(raw_trade.get("trailing_active", False))
-            logging.info("Restored daily stop counts for %s: %s", today, counts)
+            logging.info(
+                "Restored daily stop counts for %s: per_symbol=%s global=%s",
+                today,
+                counts,
+                self.global_daily_stop_count,
+            )
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             logging.warning("Could not load runtime state from %s: %s", self.state_path, exc)
 
@@ -1274,6 +1449,7 @@ class BnStraHighRisk1:
         today = datetime.now(self.tz).strftime("%Y-%m-%d")
         data = {
             "day": today,
+            "global_daily_stop_count": self.global_daily_stop_count,
             "daily_stop_counts": {
                 symbol: state.daily_stop_count
                 for symbol, state in self.states.items()

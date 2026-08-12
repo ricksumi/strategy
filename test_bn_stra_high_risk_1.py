@@ -1,10 +1,12 @@
 import os
 import unittest
 from dataclasses import replace
+from datetime import datetime
 from decimal import Decimal
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from bn_stra_high_risk_1 import (
     BinanceClient,
@@ -157,6 +159,52 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         self.assertEqual(state.rejected_signal_side, "long")
         self.assertEqual(state.rejected_signal_price, Decimal("100"))
         self.assertIsNone(state.pending_signal_side)
+
+    def test_pullback_requires_two_consecutive_signal_recross_polls(self):
+        config = replace(
+            test_config(False),
+            pullback_entry_pct=Decimal("0.004"),
+            pullback_confirm_pct=Decimal("0.002"),
+            pullback_signal_wait_seconds=300,
+            require_signal_recross=True,
+            signal_recross_wait_seconds=180,
+            signal_recross_confirm_polls=2,
+        )
+        bot = BnStraHighRisk1(config, FakeClient([]))
+        state = bot.states["ETHUSDT"]
+
+        samples = [
+            (100, Decimal("99.6"), False),
+            (115, Decimal("99.8"), False),
+            (130, Decimal("100.1"), False),
+            (145, Decimal("100.2"), True),
+        ]
+        for now, mark, expected in samples:
+            with patch.object(bot, "get_mark_price", return_value=mark), patch(
+                "bn_stra_high_risk_1.time.time", return_value=now
+            ):
+                ready = bot.pullback_entry_ready(
+                    state, "long", Decimal("100"), Decimal("0.002"), Decimal("0.05")
+                )
+            self.assertEqual(ready, expected)
+
+    def test_signal_recross_confirmation_resets_when_price_falls_back(self):
+        config = replace(
+            test_config(False),
+            require_signal_recross=True,
+            signal_recross_confirm_polls=2,
+        )
+        bot = BnStraHighRisk1(config, FakeClient([]))
+        state = bot.states["ETHUSDT"]
+        state.pending_signal_side = "long"
+        state.pending_signal_price = Decimal("100")
+        state.pending_reversal_confirmed = True
+
+        self.assertFalse(bot.signal_recross_ready(state, "long", Decimal("100.1")))
+        self.assertFalse(bot.signal_recross_ready(state, "long", Decimal("99.9")))
+        self.assertEqual(state.pending_recross_count, 0)
+        self.assertFalse(bot.signal_recross_ready(state, "long", Decimal("100.1")))
+        self.assertTrue(bot.signal_recross_ready(state, "long", Decimal("100.2")))
 
     def test_client_order_id_is_short_enough(self):
         self.assertLessEqual(len(client_order_id("SNDKUSDT", "managed")), 36)
@@ -391,6 +439,7 @@ class BnStraHighRisk1Tests(unittest.TestCase):
                 bot.on_position_closed(state)
 
         self.assertEqual(state.daily_stop_count, 1)
+        self.assertEqual(bot.global_daily_stop_count, 1)
 
     def test_profit_stop_does_not_increment_daily_stop_count(self):
         with TemporaryDirectory() as tmpdir:
@@ -446,6 +495,37 @@ class BnStraHighRisk1Tests(unittest.TestCase):
                 restarted = BnStraHighRisk1(test_config(False), FakeClient([]))
 
             self.assertEqual(restarted.states["ETHUSDT"].daily_stop_count, 2)
+
+    def test_old_state_reconstructs_global_daily_stop_count(self):
+        with TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            today = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+            state_file.write_text(
+                '{"day":"' + today + '","daily_stop_counts":{"ETHUSDT":2,"OLDUSDT":3}}\n',
+                encoding="utf-8",
+            )
+            with patch.dict("os.environ", {"BN_STRA_STATE_FILE": str(state_file)}):
+                bot = BnStraHighRisk1(test_config(False), FakeClient([]))
+
+            self.assertEqual(bot.global_daily_stop_count, 5)
+
+    def test_global_daily_stop_limit_blocks_new_entries(self):
+        config = replace(test_config(False), global_daily_stop_limit=5)
+        bot = BnStraHighRisk1(config, FakeClient([]))
+        bot.global_daily_stop_count = 5
+
+        self.assertFalse(bot.entry_limits_allow(bot.states["ETHUSDT"]))
+
+    def test_concurrent_position_limit_blocks_new_entries(self):
+        config = replace(
+            test_config(False, symbols=("ETHUSDT", "BTCUSDT", "SOLUSDT", "BNBUSDT")),
+            max_concurrent_positions=3,
+        )
+        bot = BnStraHighRisk1(config, FakeClient([]))
+        for symbol in ("ETHUSDT", "BTCUSDT", "SOLUSDT"):
+            bot.states[symbol].quantity = Decimal("1")
+
+        self.assertFalse(bot.entry_limits_allow(bot.states["BNBUSDT"]))
 
     def test_cooldown_survives_restart(self):
         with TemporaryDirectory() as tmpdir:
@@ -619,6 +699,9 @@ def test_config(dry_run=True, symbols=("ETHUSDT",), interval="5m"):
         pullback_entry_pct=Decimal("0"),
         pullback_confirm_pct=Decimal("0"),
         pullback_signal_wait_seconds=0,
+        require_signal_recross=False,
+        signal_recross_wait_seconds=180,
+        signal_recross_confirm_polls=2,
         ema_fast=20,
         ema_slow=60,
         adx_period=14,
@@ -643,6 +726,8 @@ def test_config(dry_run=True, symbols=("ETHUSDT",), interval="5m"):
         top_short_veto_min=Decimal("1.25"),
         stop_update_min_pct=Decimal("0.002"),
         daily_stop_limit=3,
+        global_daily_stop_limit=0,
+        max_concurrent_positions=0,
         cooldown_seconds=600,
         poll_seconds=15,
         kline_limit=200,

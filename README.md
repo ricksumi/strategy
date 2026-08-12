@@ -59,8 +59,11 @@ Short pullback: current price >= signal close * 1.004
 Long confirmation: price rebounds by max(0.4%, ATR percentage * 0.15) from the pullback low
 Short confirmation: price falls by max(0.4%, ATR percentage * 0.15) from the pullback high
 Signal window: 300 seconds
+Long recross: mark price returns to or above the original signal close after reversal confirmation
+Short recross: mark price returns to or below the original signal close after reversal confirmation
+Recross stability: 2 consecutive polls within a separate 180-second window
 Invalidate the current signal when adverse pullback exceeds 1.5 ATR
-Order type after confirmation: MARKET
+Order type after recross confirmation: MARKET
 ```
 
 When the signal window expires, the bot starts a new window from the latest qualifying signal.
@@ -102,12 +105,14 @@ ATR above 6% blocks new entries; ATR within the allowed range does not change po
 
 ```text
 high_vol mode: maximum 2 initial stop losses per symbol per day
+Global limit: maximum 5 initial stop losses across all symbols per Asia/Shanghai day
+Concurrent exposure: maximum 3 open positions
 Cooldown after any position closes: 30 minutes
 Position mode: one-way mode with positionSide=BOTH
 Stop trigger source: MARK_PRICE
 ```
 
-Breakeven and trailing-stop exits do not increment the daily initial-stop counter.
+Breakeven and trailing-stop exits do not increment either initial-stop counter. Once the global limit is reached, new entries pause until the next Asia/Shanghai day while existing positions continue to be protected and managed. The global count is persisted and is reconstructed from per-symbol counts when an older state file is loaded.
 
 ## Hermes notifications
 
@@ -226,7 +231,7 @@ test_bn_stra_high_risk_1.py    Unit tests
 - Protective stops are submitted through the Binance Algo Order API.
 - Trailing behavior is implemented by canceling and replacing conditional stop orders.
 - Restarting while positions are open can lose in-memory stop-management state. Prefer restarting only when the account is flat.
-- Daily initial-stop counts are persisted in `.bn-stra-high-risk-1-state.json` and restored after a restart.
+- Per-symbol and global daily initial-stop counts are persisted in `.bn-stra-high-risk-1-state.json` and restored after a restart.
 - Existing account positions outside the configured entry symbols remain monitored until they close; the bot will not reopen them.
 - The daily stop-limit message is logged once per symbol per day instead of once per polling cycle.
 - Always verify the protective stop after a live entry.
