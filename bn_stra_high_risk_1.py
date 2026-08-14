@@ -101,6 +101,13 @@ class BotConfig:
     paper_trading_only: bool = False
     entry_signal_max_distance_pct: Decimal = Decimal("0.003")
     entry_signal_max_atr_factor: Decimal = Decimal("0.25")
+    dynamic_universe_enabled: bool = False
+    active_symbol_limit: int = 60
+    universe_refresh_seconds: int = 900
+    universe_min_quote_volume: Decimal = Decimal("20000000")
+    universe_max_spread_pct: Decimal = Decimal("0.0015")
+    universe_min_listing_days: int = 30
+    universe_min_24h_range_pct: Decimal = Decimal("0.03")
 
     @classmethod
     def from_file(cls, path: str) -> "BotConfig":
@@ -182,11 +189,36 @@ class BotConfig:
             entry_signal_max_atr_factor=Decimal(
                 str(raw.get("entry_signal_max_atr_factor", "0.25"))
             ),
+            dynamic_universe_enabled=bool(raw.get("dynamic_universe_enabled", False)),
+            active_symbol_limit=int(raw.get("active_symbol_limit", 60)),
+            universe_refresh_seconds=int(raw.get("universe_refresh_seconds", 900)),
+            universe_min_quote_volume=Decimal(
+                str(raw.get("universe_min_quote_volume", "20000000"))
+            ),
+            universe_max_spread_pct=Decimal(
+                str(raw.get("universe_max_spread_pct", "0.0015"))
+            ),
+            universe_min_listing_days=int(raw.get("universe_min_listing_days", 30)),
+            universe_min_24h_range_pct=Decimal(
+                str(raw.get("universe_min_24h_range_pct", "0.03"))
+            ),
         )
 
     def validate(self) -> None:
         if not self.symbols:
             raise ValueError("symbols cannot be empty")
+        if self.active_symbol_limit <= 0:
+            raise ValueError("active_symbol_limit must be positive")
+        if self.universe_refresh_seconds < 60:
+            raise ValueError("universe_refresh_seconds must be at least 60")
+        if self.universe_min_quote_volume < 0:
+            raise ValueError("universe_min_quote_volume cannot be negative")
+        if not 0 < self.universe_max_spread_pct < 1:
+            raise ValueError("universe_max_spread_pct must be in (0, 1)")
+        if self.universe_min_listing_days < 0:
+            raise ValueError("universe_min_listing_days cannot be negative")
+        if self.universe_min_24h_range_pct < 0:
+            raise ValueError("universe_min_24h_range_pct cannot be negative")
         if self.strategy_mode not in {"core", "high_vol"}:
             raise ValueError("strategy_mode must be core or high_vol")
         if self.interval not in {"5m", "15m"}:
@@ -372,6 +404,9 @@ class BinanceClient:
         self.api_secret = api_secret.encode("utf-8")
         self.base_url = base_url.rstrip("/")
         self.recv_window = recv_window
+        self.used_weight_1m = 0
+        self.backoff_until = 0.0
+        self.last_weight_warning = 0.0
 
     def public_request(self, method: str, path: str, params: dict[str, Any] | None = None) -> Any:
         return self._request(method, path, params or {}, signed=False)
@@ -385,6 +420,11 @@ class BinanceClient:
         return self._request(method, path, payload, signed=True)
 
     def _request(self, method: str, path: str, params: dict[str, Any], signed: bool) -> Any:
+        remaining_backoff = self.backoff_until - time.time()
+        if remaining_backoff > 0:
+            logging.warning("Binance rate-limit backoff active; sleeping %.1fs", remaining_backoff)
+            time.sleep(remaining_backoff)
+
         encoded = urllib.parse.urlencode(params)
         url = f"{self.base_url}{path}"
         data = None
@@ -399,11 +439,38 @@ class BinanceClient:
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=20) as resp:
+                self._record_rate_limit_headers(resp.headers)
                 body = resp.read().decode("utf-8")
                 return json.loads(body) if body else None
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
+            self._record_rate_limit_headers(exc.headers)
+            if exc.code in {418, 429}:
+                retry_after = max(1, int(exc.headers.get("Retry-After", "60")))
+                self.backoff_until = max(self.backoff_until, time.time() + retry_after)
+                logging.error(
+                    "Binance rate limit HTTP %s; backing off for %ss used_weight_1m=%s",
+                    exc.code,
+                    retry_after,
+                    self.used_weight_1m,
+                )
             raise RuntimeError(f"Binance API error {exc.code}: {body}") from exc
+
+    def _record_rate_limit_headers(self, headers: Any) -> None:
+        raw_weight = headers.get("X-MBX-USED-WEIGHT-1M") if headers else None
+        if raw_weight is None:
+            return
+        try:
+            self.used_weight_1m = int(raw_weight)
+        except (TypeError, ValueError):
+            return
+        now = time.time()
+        if self.used_weight_1m >= 1920 and now - self.last_weight_warning >= 60:
+            logging.warning(
+                "Binance request weight is above 80%%: used_weight_1m=%s limit=2400",
+                self.used_weight_1m,
+            )
+            self.last_weight_warning = now
 
 
 class BnStraHighRisk1:
@@ -413,6 +480,11 @@ class BnStraHighRisk1:
         self.rules: dict[str, SymbolRules] = {}
         self.states = {symbol: PositionState(symbol=symbol) for symbol in config.symbols}
         self.managed_symbols = list(config.symbols)
+        self.entry_symbols = set(config.symbols)
+        self.existing_position_symbols: set[str] = set()
+        self.next_universe_refresh = 0.0
+        self.leverage_symbols: set[str] = set()
+        self.candle_cache: dict[tuple[str, str, int], tuple[float, list[Candle]]] = {}
         self.tz = ZoneInfo("Asia/Shanghai")
         self.state_path = Path(os.environ.get("BN_STRA_STATE_FILE", ".bn-stra-high-risk-1-state.json"))
         self.notifier = HermesNotifier(
@@ -432,24 +504,45 @@ class BnStraHighRisk1:
         self.config.validate()
         self.ensure_one_way_mode()
         self.discover_existing_positions()
-        self.rules = self.load_symbol_rules()
+        if self.config.dynamic_universe_enabled:
+            self.refresh_active_universe(force=True)
+        else:
+            self.rules = self.load_symbol_rules()
         self.set_leverage_for_all()
-        logging.info("Starting %s for symbols=%s dry_run=%s", STRATEGY_NAME, self.config.symbols, self.config.dry_run)
+        logging.info(
+            "Starting %s active_symbols=%s dynamic_universe=%s dry_run=%s",
+            STRATEGY_NAME,
+            tuple(self.entry_symbols),
+            self.config.dynamic_universe_enabled,
+            self.config.dry_run,
+        )
         while True:
             started = time.time()
-            for symbol in self.managed_symbols:
+            self.refresh_active_universe()
+            for symbol in tuple(self.managed_symbols):
                 try:
                     self.tick_symbol(symbol)
                 except Exception:
                     logging.exception("Tick failed for %s", symbol)
             elapsed = time.time() - started
+            if elapsed > self.config.poll_seconds:
+                logging.warning(
+                    "Scan exceeded poll interval symbols=%s elapsed=%.2fs target=%ss used_weight_1m=%s",
+                    len(self.managed_symbols),
+                    elapsed,
+                    self.config.poll_seconds,
+                    self.client.used_weight_1m,
+                )
             time.sleep(max(1, self.config.poll_seconds - elapsed))
 
     def run_once(self) -> None:
         self.config.validate()
         self.ensure_one_way_mode()
         self.discover_existing_positions()
-        self.rules = self.load_symbol_rules()
+        if self.config.dynamic_universe_enabled:
+            self.refresh_active_universe(force=True)
+        else:
+            self.rules = self.load_symbol_rules()
         self.set_leverage_for_all()
         logging.info("Running one %s scan for symbols=%s dry_run=%s", STRATEGY_NAME, self.config.symbols, self.config.dry_run)
         for symbol in self.managed_symbols:
@@ -469,7 +562,7 @@ class BnStraHighRisk1:
         if state.quantity != 0:
             self.on_position_closed(state)
 
-        if symbol not in self.config.symbols:
+        if symbol not in self.entry_symbols and state.pending_signal_side is None:
             return
 
         paper_position = self.paper_positions.get(symbol)
@@ -1492,10 +1585,82 @@ class BnStraHighRisk1:
         status = order.get("status") or order.get("algoStatus")
         return status in {"FILLED", "TRIGGERED", "FINISHED"} and state.stop_reason == "stop_loss"
 
+    def refresh_active_universe(self, force: bool = False) -> None:
+        if not self.config.dynamic_universe_enabled:
+            return
+        now = time.time()
+        if not force and now < self.next_universe_refresh:
+            return
+        try:
+            exchange_info = self.client.public_request("GET", "/fapi/v1/exchangeInfo")
+            tickers = self.client.public_request("GET", "/fapi/v1/ticker/24hr")
+            books = self.client.public_request("GET", "/fapi/v1/ticker/bookTicker")
+            selected, stats = select_active_universe(
+                exchange_info.get("symbols", []),
+                tickers,
+                books,
+                self.config.active_symbol_limit,
+                self.config.universe_min_quote_volume,
+                self.config.universe_max_spread_pct,
+                self.config.universe_min_listing_days,
+                self.config.universe_min_24h_range_pct,
+                int(now * 1000),
+            )
+            if not selected:
+                raise RuntimeError("Dynamic universe filters returned no eligible symbols")
+
+            previous = set(self.entry_symbols)
+            self.entry_symbols = set(selected)
+            sticky = set(self.paper_positions) | self.existing_position_symbols
+            sticky.update(
+                symbol
+                for symbol, state in self.states.items()
+                if state.quantity != 0 or state.pending_signal_side is not None
+            )
+            self.managed_symbols = selected + sorted(sticky - self.entry_symbols)
+            for symbol in self.managed_symbols:
+                self.states.setdefault(symbol, PositionState(symbol=symbol))
+            self.rules.update(self._rules_from_exchange_info(exchange_info, set(self.managed_symbols)))
+            missing = set(self.managed_symbols) - set(self.rules)
+            if missing:
+                raise RuntimeError(f"Missing Binance futures symbols: {sorted(missing)}")
+            self.set_leverage_for_symbols(self.entry_symbols - self.leverage_symbols)
+            self.next_universe_refresh = now + self.config.universe_refresh_seconds
+            logging.info(
+                "Dynamic universe refreshed candidates=%s eligible=%s active=%s added=%s removed=%s "
+                "min_quote_volume=%s max_spread=%.3f%% min_24h_range=%.2f%% symbols=%s",
+                stats["candidates"],
+                stats["eligible"],
+                len(selected),
+                sorted(self.entry_symbols - previous),
+                sorted(previous - self.entry_symbols),
+                self.config.universe_min_quote_volume,
+                self.config.universe_max_spread_pct * Decimal("100"),
+                self.config.universe_min_24h_range_pct * Decimal("100"),
+                selected,
+            )
+        except Exception:
+            self.next_universe_refresh = now + min(60, self.config.universe_refresh_seconds)
+            logging.exception(
+                "Dynamic universe refresh failed; retaining %s active symbols",
+                len(self.entry_symbols),
+            )
+            if force and not self.entry_symbols:
+                raise
+
     def load_symbol_rules(self) -> dict[str, SymbolRules]:
         data = self.client.public_request("GET", "/fapi/v1/exchangeInfo")
+        result = self._rules_from_exchange_info(data, set(self.managed_symbols))
+        missing = set(self.managed_symbols) - set(result)
+        if missing:
+            raise RuntimeError(f"Missing Binance futures symbols: {sorted(missing)}")
+        return result
+
+    @staticmethod
+    def _rules_from_exchange_info(
+        data: dict[str, Any], wanted: set[str]
+    ) -> dict[str, SymbolRules]:
         result: dict[str, SymbolRules] = {}
-        wanted = set(self.managed_symbols)
         for item in data["symbols"]:
             if item["symbol"] not in wanted:
                 continue
@@ -1509,18 +1674,19 @@ class BnStraHighRisk1:
                     step_size = Decimal(filt["stepSize"])
                     min_qty = Decimal(filt["minQty"])
             result[item["symbol"]] = SymbolRules(tick_size=tick_size, step_size=step_size, min_qty=min_qty)
-        missing = wanted - set(result)
-        if missing:
-            raise RuntimeError(f"Missing Binance futures symbols: {sorted(missing)}")
         return result
 
     def set_leverage_for_all(self) -> None:
-        for symbol in self.config.symbols:
+        self.set_leverage_for_symbols(self.entry_symbols)
+
+    def set_leverage_for_symbols(self, symbols: set[str]) -> None:
+        for symbol in sorted(symbols):
             params = {"symbol": symbol, "leverage": self.config.leverage}
             if self.config.dry_run:
                 logging.info("[dry-run] set leverage %s", params)
             else:
                 self.client.signed_request("POST", "/fapi/v1/leverage", params)
+            self.leverage_symbols.add(symbol)
 
     def discover_existing_positions(self) -> None:
         if self.config.dry_run:
@@ -1537,6 +1703,7 @@ class BnStraHighRisk1:
             if symbol not in self.managed_symbols:
                 self.managed_symbols.append(symbol)
                 logging.warning("Managing existing position for non-entry symbol %s; new entries remain disabled", symbol)
+            self.existing_position_symbols.add(symbol)
 
     def ensure_one_way_mode(self) -> None:
         if self.config.dry_run:
@@ -1549,6 +1716,10 @@ class BnStraHighRisk1:
             )
 
     def fetch_closed_candles(self, symbol: str, interval: str, limit: int) -> list[Candle]:
+        cache_key = (symbol, interval, limit)
+        cached = self.candle_cache.get(cache_key)
+        if cached is not None and time.time() < cached[0]:
+            return cached[1]
         rows = self.client.public_request(
             "GET", "/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit}
         )
@@ -1564,7 +1735,12 @@ class BnStraHighRisk1:
             for row in rows
         ]
         now_ms = int(time.time() * 1000)
-        return [candle for candle in candles if candle.close_time < now_ms]
+        closed = [candle for candle in candles if candle.close_time < now_ms]
+        if closed:
+            interval_ms = {"1m": 60_000, "5m": 300_000, "15m": 900_000}[interval]
+            next_close_at = (closed[-1].close_time + interval_ms + 1) / 1000
+            self.candle_cache[cache_key] = (max(time.time() + 1, next_close_at), closed)
+        return closed
 
     def fetch_candles(self, symbol: str) -> list[Candle]:
         return self.fetch_closed_candles(symbol, self.config.interval, self.config.kline_limit)
@@ -1894,6 +2070,59 @@ class BnStraHighRisk1:
             temp_path.replace(self.state_path)
         except OSError as exc:
             logging.error("Could not save runtime state to %s: %s", self.state_path, exc)
+
+
+def select_active_universe(
+    exchange_symbols: list[dict[str, Any]],
+    tickers: list[dict[str, Any]],
+    books: list[dict[str, Any]],
+    limit: int,
+    min_quote_volume: Decimal,
+    max_spread_pct: Decimal,
+    min_listing_days: int,
+    min_24h_range_pct: Decimal,
+    now_ms: int,
+) -> tuple[list[str], dict[str, int]]:
+    ticker_by_symbol = {str(item.get("symbol", "")): item for item in tickers}
+    book_by_symbol = {str(item.get("symbol", "")): item for item in books}
+    min_age_ms = min_listing_days * 86_400_000
+    candidates = [
+        item
+        for item in exchange_symbols
+        if item.get("status") == "TRADING"
+        and item.get("contractType") == "PERPETUAL"
+        and item.get("quoteAsset") == "USDT"
+    ]
+    ranked: list[tuple[Decimal, Decimal, str]] = []
+    for item in candidates:
+        symbol = str(item["symbol"])
+        onboard_date = int(item.get("onboardDate", 0) or 0)
+        if onboard_date <= 0 or now_ms - onboard_date < min_age_ms:
+            continue
+        ticker = ticker_by_symbol.get(symbol)
+        book = book_by_symbol.get(symbol)
+        if not ticker or not book:
+            continue
+        try:
+            quote_volume = Decimal(str(ticker["quoteVolume"]))
+            high = Decimal(str(ticker["highPrice"]))
+            low = Decimal(str(ticker["lowPrice"]))
+            bid = Decimal(str(book["bidPrice"]))
+            ask = Decimal(str(book["askPrice"]))
+        except (KeyError, ArithmeticError, ValueError):
+            continue
+        if quote_volume < min_quote_volume or low <= 0 or bid <= 0 or ask <= bid:
+            continue
+        mid = (bid + ask) / Decimal("2")
+        spread_pct = (ask - bid) / mid
+        range_pct = (high - low) / low
+        if spread_pct > max_spread_pct or range_pct < min_24h_range_pct:
+            continue
+        # Volume rewards executable markets; range rewards symbols that can reach ROI targets.
+        ranked.append((quote_volume * range_pct, quote_volume, symbol))
+    ranked.sort(reverse=True)
+    selected = [symbol for _, _, symbol in ranked[:limit]]
+    return selected, {"candidates": len(candidates), "eligible": len(ranked)}
 
 
 def strategy_signal(

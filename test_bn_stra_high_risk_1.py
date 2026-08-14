@@ -37,6 +37,7 @@ from bn_stra_high_risk_1 import (
     pullback_target_price,
     profit_trigger_price,
     round_stop_price,
+    select_active_universe,
     strategy_signal,
     stop_improved_by,
     trailing_callback_for_roi,
@@ -44,6 +45,44 @@ from bn_stra_high_risk_1 import (
 
 
 class BnStraHighRisk1Tests(unittest.TestCase):
+    def test_active_universe_filters_and_ranks_markets(self):
+        now_ms = 2_000_000_000_000
+        old = now_ms - 60 * 86_400_000
+        exchange_symbols = [
+            {"symbol": "FASTUSDT", "status": "TRADING", "contractType": "PERPETUAL", "quoteAsset": "USDT", "onboardDate": old},
+            {"symbol": "DEEPUSDT", "status": "TRADING", "contractType": "PERPETUAL", "quoteAsset": "USDT", "onboardDate": old},
+            {"symbol": "WIDEUSDT", "status": "TRADING", "contractType": "PERPETUAL", "quoteAsset": "USDT", "onboardDate": old},
+            {"symbol": "NEWUSDT", "status": "TRADING", "contractType": "PERPETUAL", "quoteAsset": "USDT", "onboardDate": now_ms - 5 * 86_400_000},
+            {"symbol": "DELIVERYUSDT", "status": "TRADING", "contractType": "CURRENT_QUARTER", "quoteAsset": "USDT", "onboardDate": old},
+        ]
+        tickers = [
+            {"symbol": "FASTUSDT", "quoteVolume": "50000000", "highPrice": "120", "lowPrice": "100"},
+            {"symbol": "DEEPUSDT", "quoteVolume": "100000000", "highPrice": "110", "lowPrice": "100"},
+            {"symbol": "WIDEUSDT", "quoteVolume": "100000000", "highPrice": "120", "lowPrice": "100"},
+            {"symbol": "NEWUSDT", "quoteVolume": "100000000", "highPrice": "130", "lowPrice": "100"},
+        ]
+        books = [
+            {"symbol": "FASTUSDT", "bidPrice": "100", "askPrice": "100.10"},
+            {"symbol": "DEEPUSDT", "bidPrice": "100", "askPrice": "100.05"},
+            {"symbol": "WIDEUSDT", "bidPrice": "100", "askPrice": "101"},
+            {"symbol": "NEWUSDT", "bidPrice": "100", "askPrice": "100.05"},
+        ]
+
+        selected, stats = select_active_universe(
+            exchange_symbols,
+            tickers,
+            books,
+            2,
+            Decimal("20000000"),
+            Decimal("0.0015"),
+            30,
+            Decimal("0.03"),
+            now_ms,
+        )
+
+        self.assertEqual(selected, ["DEEPUSDT", "FASTUSDT"])
+        self.assertEqual(stats, {"candidates": 4, "eligible": 2})
+
     def test_initial_stop_price(self):
         self.assertEqual(initial_stop_price(Decimal("100"), "long", Decimal("0.10"), 5), Decimal("98.00"))
         self.assertEqual(initial_stop_price(Decimal("100"), "short", Decimal("0.10"), 5), Decimal("102.00"))

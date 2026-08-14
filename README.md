@@ -32,6 +32,23 @@ BSPUSDT
 BLESSUSDT
 ```
 
+When `dynamic_universe_enabled` is `true`, this list is a startup fallback rather than the
+complete entry universe. The bot discovers every trading USDT perpetual contract and refreshes
+an active list every 15 minutes. Existing positions and pending pullback signals remain managed
+when a symbol leaves the active list.
+
+The default dynamic-universe filters are:
+
+- At least 30 days since listing
+- At least 20 million USDT of rolling 24-hour quote volume
+- Bid/ask spread no wider than 0.15%
+- Rolling 24-hour high/low range of at least 3%
+- Up to 60 active symbols, ranked by `quote volume * 24-hour range`
+
+The refresh uses three all-symbol snapshots: exchange information, 24-hour tickers, and book
+tickers. It does not download one K-line series per candidate; full strategy analysis remains
+limited to the selected active symbols.
+
 ## Signal filters
 
 ```text
@@ -234,7 +251,12 @@ test_bn_stra_high_risk_1.py    Unit tests
 
 ## Operational notes
 
-- The bot polls symbols sequentially at the configured interval.
+- The bot polls active symbols sequentially at the configured interval.
+- Binance request-weight headers are monitored. A warning is logged above 80% of the documented
+  2,400 weight/minute USD-M limit, and HTTP 429/418 responses activate the server-provided
+  `Retry-After` backoff.
+- A warning reports when a complete active-symbol scan takes longer than `poll_seconds`; in that
+  case the next scan starts one second after the previous scan completes.
 - Protective stops are submitted through the Binance Algo Order API.
 - Trailing behavior is implemented by canceling and replacing conditional stop orders.
 - Restarting while positions are open can lose in-memory stop-management state. Prefer restarting only when the account is flat.
