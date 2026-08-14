@@ -540,18 +540,21 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         }
         bot.open_paper_position("ETHUSDT", "short", Decimal("0.02"), Decimal("100"))
         position = bot.paper_positions["ETHUSDT"]
+        trade_key = bot.trade_store.trade_key("paper", "ETHUSDT", position.opened_at_ms)
         bot.execute_paper_partial_take_profit(position, 1, Decimal("0.30"), Decimal("98"))
         bot.close_paper_position(position, Decimal("99"))
 
         connection = bot.trade_store.connection
         self.assertIsNotNone(connection)
         row = connection.execute(
-            "SELECT status, close_reason, net_pnl, remaining_quantity FROM trades"
+            "SELECT status, close_reason, net_pnl, remaining_quantity FROM trades WHERE trade_key=?",
+            (trade_key,),
         ).fetchone()
         event_types = [
             item[0]
             for item in connection.execute(
-                "SELECT event_type FROM trade_events ORDER BY id"
+                "SELECT event_type FROM trade_events WHERE trade_key=? ORDER BY id",
+                (trade_key,),
             ).fetchall()
         ]
 
