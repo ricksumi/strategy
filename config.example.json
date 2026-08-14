@@ -9,6 +9,7 @@
   "universe_max_spread_pct": "0.0015",
   "universe_min_listing_days": 30,
   "universe_min_24h_range_pct": "0.03",
+  "trade_db_path": ".bn-stra-high-risk-1-trades.sqlite3",
   "interval": "5m",
   "leverage": 5,
   "margin_per_trade": "200",

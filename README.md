@@ -246,6 +246,7 @@ config.high-risk.json          High-risk configuration template
 bn-stra-high-risk-1.service    systemd user service
 install_user_service.sh        systemd installation helper
 run_once.sh                    One-scan launcher with .env loading
+trade_report.py                SQLite trade-history report
 test_bn_stra_high_risk_1.py    Unit tests
 ```
 
@@ -264,3 +265,28 @@ test_bn_stra_high_risk_1.py    Unit tests
 - Existing account positions outside the configured entry symbols remain monitored until they close; the bot will not reopen them.
 - The daily stop-limit message is logged once per symbol per day instead of once per polling cycle.
 - Always verify the protective stop after a live entry.
+
+## Trade database
+
+The bot persists paper and real trade lifecycles to the SQLite database configured by
+`trade_db_path` (default `.bn-stra-high-risk-1-trades.sqlite3`). `BN_STRA_TRADE_DB` can override
+the path. Database failures are logged but never block position protection or order handling.
+
+The `trades` table stores one row per position, including entry, exit, quantities, margin,
+best price, stops, realized PnL, commission, funding, net PnL, ROI, duration, and close reason.
+The `trade_events` table stores open, partial take-profit, stop-move, and close events. A stable
+trade key prevents a restored position from being inserted twice after a restart.
+
+Read today's trades without calling Binance:
+
+```bash
+python3 trade_report.py --date "$(date +%F)"
+```
+
+Other examples:
+
+```bash
+python3 trade_report.py --status open
+python3 trade_report.py --symbol SNDKUSDT --limit 50
+python3 trade_report.py --date 2026-08-14 --json
+```

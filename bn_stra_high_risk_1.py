@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import socket
+import sqlite3
 import time
 import urllib.error
 import urllib.parse
@@ -108,6 +109,7 @@ class BotConfig:
     universe_max_spread_pct: Decimal = Decimal("0.0015")
     universe_min_listing_days: int = 30
     universe_min_24h_range_pct: Decimal = Decimal("0.03")
+    trade_db_path: str = ".bn-stra-high-risk-1-trades.sqlite3"
 
     @classmethod
     def from_file(cls, path: str) -> "BotConfig":
@@ -202,6 +204,9 @@ class BotConfig:
             universe_min_24h_range_pct=Decimal(
                 str(raw.get("universe_min_24h_range_pct", "0.03"))
             ),
+            trade_db_path=str(
+                raw.get("trade_db_path", ".bn-stra-high-risk-1-trades.sqlite3")
+            ),
         )
 
     def validate(self) -> None:
@@ -219,6 +224,8 @@ class BotConfig:
             raise ValueError("universe_min_listing_days cannot be negative")
         if self.universe_min_24h_range_pct < 0:
             raise ValueError("universe_min_24h_range_pct cannot be negative")
+        if not self.trade_db_path:
+            raise ValueError("trade_db_path cannot be empty")
         if self.strategy_mode not in {"core", "high_vol"}:
             raise ValueError("strategy_mode must be core or high_vol")
         if self.interval not in {"5m", "15m"}:
@@ -398,6 +405,249 @@ class HermesNotifier:
             logging.warning("Hermes notification failed: %s", exc)
 
 
+class TradeStore:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.connection: sqlite3.Connection | None = None
+        try:
+            self.connection = sqlite3.connect(path, timeout=5)
+            self.connection.execute("PRAGMA journal_mode=WAL")
+            self.connection.execute("PRAGMA busy_timeout=5000")
+            self.connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_key TEXT NOT NULL UNIQUE,
+                    strategy TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    leverage INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    opened_at_ms INTEGER NOT NULL,
+                    closed_at_ms INTEGER,
+                    entry_price TEXT NOT NULL,
+                    exit_price TEXT,
+                    initial_quantity TEXT NOT NULL,
+                    remaining_quantity TEXT NOT NULL,
+                    initial_margin TEXT NOT NULL,
+                    initial_stop_price TEXT NOT NULL,
+                    last_stop_price TEXT NOT NULL,
+                    best_price TEXT NOT NULL,
+                    close_reason TEXT,
+                    realized_gross_pnl TEXT,
+                    commission TEXT,
+                    funding TEXT,
+                    net_pnl TEXT,
+                    margin_roi TEXT,
+                    duration_seconds INTEGER,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_trades_opened_at ON trades(opened_at_ms);
+                CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
+                CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
+                CREATE TABLE IF NOT EXISTS trade_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_key TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_at_ms INTEGER NOT NULL,
+                    price TEXT,
+                    quantity TEXT,
+                    remaining_quantity TEXT,
+                    stop_price TEXT,
+                    realized_gross_pnl TEXT,
+                    commission TEXT,
+                    details_json TEXT,
+                    FOREIGN KEY(trade_key) REFERENCES trades(trade_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_trade_events_key_time
+                    ON trade_events(trade_key, event_at_ms);
+                """
+            )
+            self.connection.commit()
+        except sqlite3.Error as exc:
+            logging.error("Could not initialize trade database %s: %s", path, exc)
+            self.connection = None
+
+    @staticmethod
+    def trade_key(mode: str, symbol: str, opened_at_ms: int) -> str:
+        return f"{mode}:{symbol}:{opened_at_ms}"
+
+    def record_open(
+        self,
+        mode: str,
+        symbol: str,
+        side: str,
+        leverage: int,
+        opened_at_ms: int,
+        entry_price: Decimal,
+        quantity: Decimal,
+        margin: Decimal,
+        stop_price: Decimal,
+        best_price: Decimal,
+    ) -> None:
+        if self.connection is None:
+            return
+        key = self.trade_key(mode, symbol, opened_at_ms)
+        now_ms = int(time.time() * 1000)
+        try:
+            cursor = self.connection.execute(
+                """
+                INSERT OR IGNORE INTO trades (
+                    trade_key, strategy, mode, symbol, side, leverage, status,
+                    opened_at_ms, entry_price, initial_quantity, remaining_quantity,
+                    initial_margin, initial_stop_price, last_stop_price, best_price,
+                    created_at_ms, updated_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    key, STRATEGY_NAME, mode, symbol, side, leverage, opened_at_ms,
+                    format_decimal(entry_price), format_decimal(quantity), format_decimal(quantity),
+                    format_decimal(margin), format_decimal(stop_price), format_decimal(stop_price),
+                    format_decimal(best_price), now_ms, now_ms,
+                ),
+            )
+            if cursor.rowcount:
+                self._record_event(key, "open", opened_at_ms, entry_price, quantity, quantity, stop_price)
+            self.connection.commit()
+        except sqlite3.Error as exc:
+            logging.error("Trade database open write failed for %s: %s", key, exc)
+
+    def record_position_update(
+        self,
+        mode: str,
+        symbol: str,
+        opened_at_ms: int,
+        best_price: Decimal,
+        stop_price: Decimal,
+        remaining_quantity: Decimal,
+    ) -> None:
+        if self.connection is None:
+            return
+        key = self.trade_key(mode, symbol, opened_at_ms)
+        try:
+            self.connection.execute(
+                """
+                UPDATE trades SET best_price=?, last_stop_price=?, remaining_quantity=?, updated_at_ms=?
+                WHERE trade_key=? AND status='open'
+                """,
+                (
+                    format_decimal(best_price), format_decimal(stop_price),
+                    format_decimal(remaining_quantity), int(time.time() * 1000), key,
+                ),
+            )
+            self.connection.commit()
+        except sqlite3.Error as exc:
+            logging.error("Trade database position update failed for %s: %s", key, exc)
+
+    def record_event(
+        self,
+        mode: str,
+        symbol: str,
+        opened_at_ms: int,
+        event_type: str,
+        price: Decimal | None = None,
+        quantity: Decimal | None = None,
+        remaining_quantity: Decimal | None = None,
+        stop_price: Decimal | None = None,
+        realized_gross_pnl: Decimal | None = None,
+        commission: Decimal | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if self.connection is None:
+            return
+        key = self.trade_key(mode, symbol, opened_at_ms)
+        try:
+            self._record_event(
+                key, event_type, int(time.time() * 1000), price, quantity,
+                remaining_quantity, stop_price, realized_gross_pnl, commission, details,
+            )
+            self.connection.commit()
+        except sqlite3.Error as exc:
+            logging.error("Trade database event write failed for %s: %s", key, exc)
+
+    def record_close(
+        self,
+        mode: str,
+        symbol: str,
+        opened_at_ms: int,
+        exit_price: Decimal | None,
+        best_price: Decimal,
+        last_stop_price: Decimal,
+        close_reason: str,
+        realized_gross_pnl: Decimal | None,
+        commission: Decimal | None,
+        funding: Decimal | None,
+        net_pnl: Decimal | None,
+        margin_roi_value: Decimal | None,
+        remaining_quantity: Decimal,
+    ) -> None:
+        if self.connection is None:
+            return
+        key = self.trade_key(mode, symbol, opened_at_ms)
+        closed_at_ms = int(time.time() * 1000)
+        try:
+            self.connection.execute(
+                """
+                UPDATE trades SET status='closed', closed_at_ms=?, exit_price=?,
+                    remaining_quantity=?, last_stop_price=?, best_price=?, close_reason=?,
+                    realized_gross_pnl=?, commission=?, funding=?, net_pnl=?, margin_roi=?,
+                    duration_seconds=?, updated_at_ms=?
+                WHERE trade_key=?
+                """,
+                (
+                    closed_at_ms, self._decimal(exit_price), "0",
+                    format_decimal(last_stop_price), format_decimal(best_price), close_reason,
+                    self._decimal(realized_gross_pnl), self._decimal(commission),
+                    self._decimal(funding), self._decimal(net_pnl),
+                    self._decimal(margin_roi_value), max(0, (closed_at_ms - opened_at_ms) // 1000),
+                    closed_at_ms, key,
+                ),
+            )
+            self._record_event(
+                key, "close", closed_at_ms, exit_price, remaining_quantity,
+                Decimal("0"), last_stop_price, realized_gross_pnl, commission,
+                {"reason": close_reason, "net_pnl": self._decimal(net_pnl)},
+            )
+            self.connection.commit()
+        except sqlite3.Error as exc:
+            logging.error("Trade database close write failed for %s: %s", key, exc)
+
+    def _record_event(
+        self,
+        trade_key: str,
+        event_type: str,
+        event_at_ms: int,
+        price: Decimal | None = None,
+        quantity: Decimal | None = None,
+        remaining_quantity: Decimal | None = None,
+        stop_price: Decimal | None = None,
+        realized_gross_pnl: Decimal | None = None,
+        commission: Decimal | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        assert self.connection is not None
+        self.connection.execute(
+            """
+            INSERT INTO trade_events (
+                trade_key, event_type, event_at_ms, price, quantity, remaining_quantity,
+                stop_price, realized_gross_pnl, commission, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                trade_key, event_type, event_at_ms, self._decimal(price), self._decimal(quantity),
+                self._decimal(remaining_quantity), self._decimal(stop_price),
+                self._decimal(realized_gross_pnl), self._decimal(commission),
+                json.dumps(details, sort_keys=True) if details else None,
+            ),
+        )
+
+    @staticmethod
+    def _decimal(value: Decimal | None) -> str | None:
+        return format_decimal(value) if value is not None else None
+
+
 class BinanceClient:
     def __init__(self, api_key: str, api_secret: str, base_url: str, recv_window: int) -> None:
         self.api_key = api_key
@@ -487,6 +737,7 @@ class BnStraHighRisk1:
         self.candle_cache: dict[tuple[str, str, int], tuple[float, list[Candle]]] = {}
         self.tz = ZoneInfo("Asia/Shanghai")
         self.state_path = Path(os.environ.get("BN_STRA_STATE_FILE", ".bn-stra-high-risk-1-state.json"))
+        self.trade_store = TradeStore(os.environ.get("BN_STRA_TRADE_DB", config.trade_db_path))
         self.notifier = HermesNotifier(
             config.hermes_enabled and not config.dry_run,
             config.hermes_socket_path,
@@ -499,6 +750,8 @@ class BnStraHighRisk1:
         self.position_limit_logged = False
         self.paper_positions: dict[str, PaperPosition] = {}
         self.load_runtime_state()
+        for position in self.paper_positions.values():
+            self.record_paper_open(position)
 
     def run_forever(self) -> None:
         self.config.validate()
@@ -828,6 +1081,10 @@ class BnStraHighRisk1:
         state.partial_take_2_done = False
         self.clear_pending_signal(state)
         self.save_runtime_state()
+        self.trade_store.record_open(
+            "real", symbol, side, self.config.leverage, state.opened_at_ms,
+            entry_price, executed_qty, state.initial_margin, stop_price, state.best_price,
+        )
         logging.info(
             "%s opened %s entry=%s qty=%s initial_stop=%s stop_algo_id=%s stop_client_id=%s margin=%s equity=%s",
             symbol,
@@ -895,6 +1152,7 @@ class BnStraHighRisk1:
         self.paper_positions[symbol] = position
         self.clear_pending_signal(self.states[symbol])
         self.save_runtime_state()
+        self.record_paper_open(position)
         logging.info(
             "%s paper opened side=%s entry=%s qty=%s initial_stop=%s margin=%s",
             symbol, side, entry_price, quantity, stop_price, position.initial_margin,
@@ -970,6 +1228,16 @@ class BnStraHighRisk1:
                 position.symbol, position.side, mark_price, position.best_price, old_stop, new_stop,
                 position.stop_reason,
             )
+            self.trade_store.record_event(
+                "paper", position.symbol, position.opened_at_ms, "stop_moved",
+                price=mark_price, remaining_quantity=position.remaining_quantity,
+                stop_price=position.stop_price,
+                details={"reason": position.stop_reason, "old_stop": format_decimal(old_stop)},
+            )
+        self.trade_store.record_position_update(
+            "paper", position.symbol, position.opened_at_ms, position.best_price,
+            position.stop_price, position.remaining_quantity,
+        )
         self.save_runtime_state()
 
     def execute_paper_partial_take_profit(
@@ -994,6 +1262,17 @@ class BnStraHighRisk1:
             position.symbol, tier, close_qty, fill_price, position.remaining_quantity,
             position.realized_gross_pnl,
         )
+        self.trade_store.record_event(
+            "paper", position.symbol, position.opened_at_ms, f"partial_take_{tier}",
+            price=fill_price, quantity=close_qty,
+            remaining_quantity=position.remaining_quantity, stop_price=position.stop_price,
+            realized_gross_pnl=position.realized_gross_pnl,
+            commission=-position.commission,
+        )
+        self.trade_store.record_position_update(
+            "paper", position.symbol, position.opened_at_ms, position.best_price,
+            position.stop_price, position.remaining_quantity,
+        )
 
     def close_paper_position(self, position: PaperPosition, fill_price: Decimal) -> None:
         position.realized_gross_pnl += gross_pnl(
@@ -1007,6 +1286,12 @@ class BnStraHighRisk1:
             "%s paper closed side=%s reason=%s fill=%s gross=%s commission=%s net=%s roi=%s%%",
             position.symbol, position.side, position.stop_reason, fill_price,
             position.realized_gross_pnl, position.commission, net_pnl, roi,
+        )
+        self.trade_store.record_close(
+            "paper", position.symbol, position.opened_at_ms, fill_price,
+            position.best_price, position.stop_price, position.stop_reason,
+            position.realized_gross_pnl, -position.commission, Decimal("0"), net_pnl,
+            roi, position.remaining_quantity,
         )
         self.notifier.send(
             "\n".join(
@@ -1028,6 +1313,13 @@ class BnStraHighRisk1:
         del self.paper_positions[position.symbol]
         self.states[position.symbol].cooldown_until = time.time() + self.config.cooldown_seconds
         self.save_runtime_state()
+
+    def record_paper_open(self, position: PaperPosition) -> None:
+        self.trade_store.record_open(
+            "paper", position.symbol, position.side, self.config.leverage,
+            position.opened_at_ms, position.entry_price, position.quantity,
+            position.initial_margin, position.stop_price, position.best_price,
+        )
 
     def notify_paper_position_opened(self, position: PaperPosition) -> None:
         reason = (
@@ -1132,6 +1424,15 @@ class BnStraHighRisk1:
                 state.stop_client_id,
                 state.stop_reason,
             )
+            self.trade_store.record_event(
+                "real", state.symbol, state.opened_at_ms, "stop_moved",
+                price=mark_price, remaining_quantity=state.quantity, stop_price=state.stop_price,
+                details={"reason": state.stop_reason, "old_stop": format_decimal(old_stop)},
+            )
+        self.trade_store.record_position_update(
+            "real", state.symbol, state.opened_at_ms, state.best_price,
+            state.stop_price, state.quantity,
+        )
 
     def execute_partial_take_profit(
         self, state: PositionState, tier: int, fraction: Decimal, mark_price: Decimal
@@ -1173,6 +1474,15 @@ class BnStraHighRisk1:
         logging.info(
             "%s partial take-profit tier=%s qty=%s fill=%s remaining=%s estimated_gross_pnl=%s",
             state.symbol, tier, close_qty, fill_price, state.quantity, realized_estimate,
+        )
+        self.trade_store.record_event(
+            "real", state.symbol, state.opened_at_ms, f"partial_take_{tier}",
+            price=fill_price, quantity=close_qty, remaining_quantity=state.quantity,
+            stop_price=state.stop_price, realized_gross_pnl=realized_estimate,
+        )
+        self.trade_store.record_position_update(
+            "real", state.symbol, state.opened_at_ms, state.best_price,
+            state.stop_price, state.quantity,
         )
 
     def replace_stop_order(self, state: PositionState, new_stop: Decimal) -> None:
@@ -1231,6 +1541,7 @@ class BnStraHighRisk1:
         close_stop_client_id = state.stop_client_id
         close_opened_at_ms = state.opened_at_ms
         close_margin = state.initial_margin
+        close_best_price = state.best_price
         logging.info(
             "%s position closed side=%s entry=%s qty=%s last_stop=%s stop_algo_id=%s stop_client_id=%s stop_reason=%s; entering cooldown",
             state.symbol,
@@ -1260,7 +1571,13 @@ class BnStraHighRisk1:
                 self.notify_global_daily_stop_limit()
         self.cancel_open_orders(state.symbol)
         self.cancel_algo_open_orders(state.symbol)
-        self.notify_position_closed(state, close_opened_at_ms, close_margin)
+        pnl_summary = self.notify_position_closed(state, close_opened_at_ms, close_margin)
+        self.trade_store.record_close(
+            "real", state.symbol, close_opened_at_ms, None, close_best_price,
+            close_stop_price, state.stop_reason,
+            pnl_summary["realized"], pnl_summary["commission"], pnl_summary["funding"],
+            pnl_summary["net"], pnl_summary["roi"], close_qty,
+        )
         state.side = None
         state.entry_price = Decimal("0")
         state.quantity = Decimal("0")
@@ -1322,7 +1639,9 @@ class BnStraHighRisk1:
             )
         )
 
-    def notify_position_closed(self, state: PositionState, opened_at_ms: int, initial_margin: Decimal) -> None:
+    def notify_position_closed(
+        self, state: PositionState, opened_at_ms: int, initial_margin: Decimal
+    ) -> dict[str, Decimal | None]:
         now_ms = int(time.time() * 1000)
         realized = Decimal("0")
         commission = Decimal("0")
@@ -1368,6 +1687,13 @@ class BnStraHighRisk1:
                 ]
             )
         )
+        return {
+            "realized": realized if complete else None,
+            "commission": commission if complete else None,
+            "funding": funding if complete else None,
+            "net": net if complete else None,
+            "roi": roi,
+        }
 
     def pullback_entry_ready(
         self,
@@ -1806,6 +2132,10 @@ class BnStraHighRisk1:
             if state.initial_quantity <= 0:
                 state.initial_quantity = abs(amt)
             self.save_runtime_state()
+            self.trade_store.record_open(
+                "real", state.symbol, side, self.config.leverage, state.opened_at_ms,
+                entry, abs(amt), state.initial_margin, state.stop_price, state.best_price,
+            )
         else:
             state.quantity = abs(amt)
 

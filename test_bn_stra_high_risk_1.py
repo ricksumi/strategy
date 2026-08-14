@@ -531,6 +531,36 @@ class BnStraHighRisk1Tests(unittest.TestCase):
             self.assertEqual(restored.entry_price, Decimal("100"))
             self.assertEqual(restored.stop_price, Decimal("102"))
 
+    def test_paper_trade_lifecycle_is_persisted_to_sqlite(self):
+        bot = BnStraHighRisk1(test_config(False), FakeClient([]))
+        bot.rules = {
+            "ETHUSDT": SymbolRules(
+                tick_size=Decimal("0.01"), step_size=Decimal("1"), min_qty=Decimal("1")
+            )
+        }
+        bot.open_paper_position("ETHUSDT", "short", Decimal("0.02"), Decimal("100"))
+        position = bot.paper_positions["ETHUSDT"]
+        bot.execute_paper_partial_take_profit(position, 1, Decimal("0.30"), Decimal("98"))
+        bot.close_paper_position(position, Decimal("99"))
+
+        connection = bot.trade_store.connection
+        self.assertIsNotNone(connection)
+        row = connection.execute(
+            "SELECT status, close_reason, net_pnl, remaining_quantity FROM trades"
+        ).fetchone()
+        event_types = [
+            item[0]
+            for item in connection.execute(
+                "SELECT event_type FROM trade_events ORDER BY id"
+            ).fetchall()
+        ]
+
+        self.assertEqual(row[0], "closed")
+        self.assertEqual(row[1], "stop_loss")
+        self.assertGreater(Decimal(row[2]), Decimal("0"))
+        self.assertEqual(row[3], "0")
+        self.assertEqual(event_types, ["open", "partial_take_1", "close"])
+
     def test_dynamic_paper_position_survives_restart_outside_static_symbols(self):
         with TemporaryDirectory() as tmpdir:
             state_file = Path(tmpdir) / "state.json"
@@ -1027,6 +1057,7 @@ def test_config(dry_run=True, symbols=("ETHUSDT",), interval="5m"):
         dry_run=dry_run,
         testnet=False,
         recv_window=5000,
+        trade_db_path=":memory:",
     )
 
 
