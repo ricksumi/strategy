@@ -323,6 +323,21 @@ class BnStraHighRisk1Tests(unittest.TestCase):
 
         self.assertEqual(client.stop_quantities, [])
 
+    def test_paper_only_mode_does_not_change_account_leverage(self):
+        client = RecordingClient()
+        bot = BnStraHighRisk1(
+            replace(
+                test_config(False, symbols=("ETHUSDT", "BTCUSDT")),
+                paper_trading_only=True,
+            ),
+            client,
+        )
+
+        bot.set_leverage_for_all()
+
+        self.assertEqual(client.calls, [])
+        self.assertEqual(bot.leverage_symbols, {"ETHUSDT", "BTCUSDT"})
+
     def test_insufficient_margin_notifies_without_placing_order(self):
         with TemporaryDirectory() as tmpdir:
             state_file = Path(tmpdir) / "state.json"

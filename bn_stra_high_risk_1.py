@@ -2006,6 +2006,9 @@ class BnStraHighRisk1:
         self.set_leverage_for_symbols(self.entry_symbols)
 
     def set_leverage_for_symbols(self, symbols: set[str]) -> None:
+        if self.config.paper_trading_only:
+            self.leverage_symbols.update(symbols)
+            return
         for symbol in sorted(symbols):
             params = {"symbol": symbol, "leverage": self.config.leverage}
             if self.config.dry_run:
