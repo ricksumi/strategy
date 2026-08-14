@@ -531,6 +531,28 @@ class BnStraHighRisk1Tests(unittest.TestCase):
             self.assertEqual(restored.entry_price, Decimal("100"))
             self.assertEqual(restored.stop_price, Decimal("102"))
 
+    def test_dynamic_paper_position_survives_restart_outside_static_symbols(self):
+        with TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            first_config = test_config(False, symbols=("ACUUSDT",))
+            second_config = replace(
+                test_config(False, symbols=("ETHUSDT",)), dynamic_universe_enabled=True
+            )
+            with patch.dict("os.environ", {"BN_STRA_STATE_FILE": str(state_file)}):
+                first = BnStraHighRisk1(first_config, FakeClient([]))
+                first.rules = {
+                    "ACUUSDT": SymbolRules(
+                        tick_size=Decimal("0.00001"), step_size=Decimal("1"), min_qty=Decimal("1")
+                    )
+                }
+                first.get_mark_price = lambda symbol: Decimal("0.10")
+                first.open_paper_position("ACUUSDT", "short", Decimal("0.02"))
+                second = BnStraHighRisk1(second_config, FakeClient([]))
+
+            self.assertIn("ACUUSDT", second.paper_positions)
+            self.assertIn("ACUUSDT", second.states)
+            self.assertIn("ACUUSDT", second.managed_symbols)
+
     def test_replace_stop_order_places_new_protection_before_canceling_old(self):
         client = RecordingClient()
         bot = BnStraHighRisk1(test_config(False), client)

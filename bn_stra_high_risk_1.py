@@ -1980,8 +1980,12 @@ class BnStraHighRisk1:
             if not isinstance(paper_positions, dict):
                 raise ValueError("paper_positions must be an object")
             for symbol, raw_position in paper_positions.items():
-                if not isinstance(raw_position, dict) or symbol not in self.states:
+                if not isinstance(raw_position, dict):
                     continue
+                if symbol not in self.states:
+                    self.states[symbol] = PositionState(symbol=symbol)
+                if symbol not in self.managed_symbols:
+                    self.managed_symbols.append(symbol)
                 self.paper_positions[symbol] = PaperPosition(
                     symbol=symbol,
                     side=str(raw_position["side"]),
