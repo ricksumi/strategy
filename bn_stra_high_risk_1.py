@@ -2090,7 +2090,7 @@ def select_active_universe(
         item
         for item in exchange_symbols
         if item.get("status") == "TRADING"
-        and item.get("contractType") == "PERPETUAL"
+        and item.get("contractType") in {"PERPETUAL", "TRADIFI_PERPETUAL"}
         and item.get("quoteAsset") == "USDT"
     ]
     ranked: list[tuple[Decimal, Decimal, str]] = []

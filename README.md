@@ -33,7 +33,7 @@ BLESSUSDT
 ```
 
 When `dynamic_universe_enabled` is `true`, this list is a startup fallback rather than the
-complete entry universe. The bot discovers every trading USDT perpetual contract and refreshes
+complete entry universe. The bot discovers every trading USDT crypto or TradFi perpetual contract and refreshes
 an active list every 15 minutes. Existing positions and pending pullback signals remain managed
 when a symbol leaves the active list.
 
