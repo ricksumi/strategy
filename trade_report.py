@@ -64,11 +64,13 @@ def main() -> None:
     print("opened_at           mode  symbol          side   status  entry          exit           net_pnl     roi       reason")
     print("-" * 116)
     for item in items:
+        net_pnl = format_metric(item["net_pnl"])
+        roi = format_metric(item["margin_roi"])
         print(
             f"{item['opened_at']:<19} {item['mode']:<5} {item['symbol']:<15} "
             f"{item['side']:<6} {item['status']:<7} {item['entry_price']:<14} "
-            f"{(item['exit_price'] or '-'):<14} {(item['net_pnl'] or '-'):<11} "
-            f"{(item['margin_roi'] or '-'):<9} {item['close_reason'] or '-'}"
+            f"{(item['exit_price'] or '-'):<14} {net_pnl:<11} "
+            f"{roi:<9} {item['close_reason'] or '-'}"
         )
     closed = [item for item in items if item["status"] == "closed" and item["net_pnl"] is not None]
     net = sum((Decimal(item["net_pnl"]) for item in closed), Decimal("0"))
@@ -80,6 +82,10 @@ def format_time(timestamp_ms: int | None) -> str:
     if not timestamp_ms:
         return "-"
     return datetime.fromtimestamp(timestamp_ms / 1000, TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def format_metric(value: str | None) -> str:
+    return f"{Decimal(value):.4f}" if value is not None else "-"
 
 
 if __name__ == "__main__":
