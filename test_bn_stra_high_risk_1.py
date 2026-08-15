@@ -218,6 +218,7 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         state.pending_signal_price = Decimal("100")
         state.pending_reversal_confirmed = True
         state.pending_recross_candle_open_after_ms = 120000
+        state.pending_signal_until = 180
         eligible = Candle(
             open_time=120000,
             open=Decimal("99.8"),
@@ -232,6 +233,56 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         with patch.object(bot, "fetch_closed_candles", return_value=[eligible]):
             self.assertTrue(bot.signal_recross_ready(state, "long", Decimal("100.2")))
             self.assertFalse(bot.signal_recross_ready(state, "long", Decimal("99.9")))
+
+    def test_recross_window_checks_last_complete_candle_before_expiring(self):
+        config = replace(
+            test_config(False),
+            pullback_entry_pct=Decimal("0.004"),
+            require_signal_recross=True,
+            signal_recross_wait_seconds=180,
+        )
+        bot = BnStraHighRisk1(config, FakeClient([]))
+        state = bot.states["ETHUSDT"]
+        state.pending_signal_side = "long"
+        state.pending_signal_price = Decimal("100")
+        state.pending_reversal_confirmed = True
+        state.pending_recross_candle_open_after_ms = 240000
+        state.pending_signal_until = 420
+        final_candle = Candle(
+            open_time=360000,
+            open=Decimal("99.8"),
+            high=Decimal("100.3"),
+            low=Decimal("99.7"),
+            close=Decimal("100.1"),
+            close_time=419999,
+        )
+
+        with patch("bn_stra_high_risk_1.time.time", return_value=421), patch.object(
+            bot, "get_mark_price", return_value=Decimal("100.2")
+        ), patch.object(bot, "fetch_closed_candles", return_value=[final_candle]):
+            ready = bot.pullback_entry_ready(state, "long", Decimal("100"))
+
+        self.assertTrue(ready)
+        self.assertEqual(state.pending_signal_side, "long")
+
+    def test_recross_window_starts_with_first_full_candle(self):
+        config = replace(
+            test_config(False),
+            pullback_entry_pct=Decimal("0.004"),
+            require_signal_recross=True,
+            signal_recross_wait_seconds=180,
+        )
+        bot = BnStraHighRisk1(config, FakeClient([]))
+        state = bot.states["ETHUSDT"]
+        state.pending_signal_price = Decimal("100")
+
+        with patch("bn_stra_high_risk_1.time.time", return_value=233), patch.object(
+            bot, "fetch_closed_candles", return_value=[]
+        ):
+            bot.on_pullback_reversal_confirmed(state, "long", Decimal("99.8"))
+
+        self.assertEqual(state.pending_recross_candle_open_after_ms, 240000)
+        self.assertEqual(state.pending_signal_until, 420)
 
     def test_entry_signal_distance_blocks_chasing(self):
         limit = Decimal("0.003")

@@ -1713,6 +1713,9 @@ class BnStraHighRisk1:
             and state.pending_reversal_confirmed
             and now >= state.pending_signal_until
         ):
+            mark_price = self.get_mark_price(state.symbol)
+            if self.signal_recross_ready(state, side, mark_price):
+                return True
             rejected_price = state.pending_signal_price
             state.rejected_signal_side = side
             state.rejected_signal_price = rejected_price
@@ -1832,7 +1835,10 @@ class BnStraHighRisk1:
         state.pending_recross_count = 0
         now_ms = int(time.time() * 1000)
         state.pending_recross_candle_open_after_ms = ((now_ms // 60000) + 1) * 60000
-        state.pending_signal_until = time.time() + self.config.signal_recross_wait_seconds
+        state.pending_signal_until = (
+            state.pending_recross_candle_open_after_ms / 1000
+            + self.config.signal_recross_wait_seconds
+        )
         logging.info(
             "%s reversal confirmed side=%s; waiting closed 1m signal-price recross signal_price=%s "
             "first_eligible_candle_open=%s wait_until=%s",
@@ -1852,6 +1858,7 @@ class BnStraHighRisk1:
             candle
             for candle in candles
             if candle.open_time >= state.pending_recross_candle_open_after_ms
+            and candle.close_time <= int(state.pending_signal_until * 1000)
         ]
         if not eligible:
             logging.info(
