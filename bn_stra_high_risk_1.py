@@ -2021,7 +2021,18 @@ class BnStraHighRisk1:
             if self.config.dry_run:
                 logging.info("[dry-run] set leverage %s", params)
             else:
-                self.client.signed_request("POST", "/fapi/v1/leverage", params)
+                try:
+                    self.client.signed_request("POST", "/fapi/v1/leverage", params)
+                except RuntimeError as exc:
+                    self.entry_symbols.discard(symbol)
+                    if symbol in self.states:
+                        self.clear_pending_signal(self.states[symbol])
+                    logging.error(
+                        "%s leverage setup failed; new entries disabled for this refresh: %s",
+                        symbol,
+                        exc,
+                    )
+                    continue
             self.leverage_symbols.add(symbol)
 
     def discover_existing_positions(self) -> None:

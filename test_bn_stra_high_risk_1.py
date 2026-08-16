@@ -389,6 +389,28 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         self.assertEqual(client.calls, [])
         self.assertEqual(bot.leverage_symbols, {"ETHUSDT", "BTCUSDT"})
 
+    def test_failed_leverage_setup_disables_only_that_symbol(self):
+        class LeverageClient(BinanceClient):
+            def __init__(self):
+                pass
+
+            def signed_request(self, method, path, params=None):
+                if params["symbol"] == "BADUSDT":
+                    raise RuntimeError("Leverage 5 is not valid")
+                return {"symbol": params["symbol"], "leverage": 5}
+
+        bot = BnStraHighRisk1(
+            test_config(False, symbols=("BADUSDT", "ETHUSDT")),
+            LeverageClient(),
+        )
+
+        bot.set_leverage_for_all()
+
+        self.assertNotIn("BADUSDT", bot.entry_symbols)
+        self.assertNotIn("BADUSDT", bot.leverage_symbols)
+        self.assertIn("ETHUSDT", bot.entry_symbols)
+        self.assertIn("ETHUSDT", bot.leverage_symbols)
+
     def test_insufficient_margin_notifies_without_placing_order(self):
         with TemporaryDirectory() as tmpdir:
             state_file = Path(tmpdir) / "state.json"
