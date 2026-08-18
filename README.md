@@ -128,6 +128,7 @@ ATR above 6% blocks new entries; ATR within the allowed range does not change po
 ```text
 high_vol mode: maximum 2 initial stop losses per symbol per day
 Global limit: pause new entries after more than 5 confirmed initial stop losses across all symbols per Asia/Shanghai day
+Daily net loss limit: pause new entries when closed real trades reach -60 USDT net PnL per Asia/Shanghai day
 Concurrent exposure: maximum 3 open positions
 Cooldown after any position closes: 30 minutes
 Position mode: one-way mode with positionSide=BOTH
@@ -135,6 +136,8 @@ Stop trigger source: MARK_PRICE
 ```
 
 Only an initial protective stop that Binance confirms as triggered or finished increments the stop counters. Manual closes, unconfirmed closes, breakeven exits, and trailing-stop exits do not count. The sixth confirmed initial stop pauses real entries until the next Asia/Shanghai day while existing positions continue to be protected and managed. A Hermes notification is sent once when the limit is exceeded. The global count and notification state are persisted and the count is reconstructed from per-symbol counts when an older state file is loaded.
+
+The independent `global_daily_net_loss_limit` uses the sum of `net_pnl` for real trades closed during the current Asia/Shanghai day. With the default `60 USDT` threshold, new real entries pause as soon as that sum reaches `-60 USDT`, regardless of win/loss counts. Existing positions continue to be managed and qualified entries become paper trades when `paper_signals_after_global_stop` is enabled. The value is reconstructed from SQLite after a restart, and a separate Hermes notification is sent once per day when the threshold is reached.
 
 When `paper_trading_only` is enabled, every qualified entry becomes a clearly labeled paper position and no Binance entry order is submitted, regardless of daily stop counters or day changes. `paper_signals_after_global_stop` provides the narrower fallback mode when live trading is enabled but the global limit has paused real orders. Paper positions use the configured fixed margin and leverage and follow the same stop cap, partial exits, profit lock, and trailing-stop tiers. They survive service restarts and produce only `PAPER OPEN - NO REAL ORDER` and `PAPER CLOSED - NO REAL ORDER` Hermes messages. Estimated paper PnL includes configured trading commissions but treats funding as zero.
 

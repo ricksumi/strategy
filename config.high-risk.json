@@ -60,6 +60,7 @@
   "stop_update_min_pct": "0.002",
   "daily_stop_limit": 2,
   "global_daily_stop_limit": 5,
+  "global_daily_net_loss_limit": "60",
   "paper_signals_after_global_stop": true,
   "paper_trading_only": true,
   "max_concurrent_positions": 3,

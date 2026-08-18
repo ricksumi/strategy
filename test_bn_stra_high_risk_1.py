@@ -1,4 +1,5 @@
 import os
+import time
 import unittest
 from dataclasses import replace
 from datetime import datetime
@@ -897,6 +898,63 @@ class BnStraHighRisk1Tests(unittest.TestCase):
 
         self.assertEqual(len(notifier.messages), 1)
         self.assertIn("[GLOBAL DAILY STOP LIMIT EXCEEDED]", notifier.messages[0])
+
+    def test_global_daily_net_loss_limit_blocks_at_exact_threshold(self):
+        config = replace(
+            test_config(False),
+            global_daily_net_loss_limit=Decimal("60"),
+            paper_signals_after_global_stop=True,
+        )
+        bot = BnStraHighRisk1(config, FakeClient([]))
+        bot.global_daily_net_pnl = Decimal("-60")
+
+        self.assertTrue(bot.global_entries_paused())
+        self.assertFalse(bot.entry_limits_allow(bot.states["ETHUSDT"]))
+
+    def test_global_daily_net_loss_notification_is_sent_once(self):
+        with TemporaryDirectory() as tmpdir, patch.dict(
+            "os.environ", {"BN_STRA_STATE_FILE": str(Path(tmpdir) / "state.json")}
+        ):
+            config = replace(test_config(False), global_daily_net_loss_limit=Decimal("60"))
+            bot = BnStraHighRisk1(config, FakeClient([]))
+            notifier = RecordingNotifier()
+            bot.notifier = notifier
+            bot.global_daily_net_pnl = Decimal("-60.25")
+
+            bot.log_and_notify_global_pause()
+            bot.log_and_notify_global_pause()
+
+        self.assertEqual(len(notifier.messages), 1)
+        self.assertIn("[GLOBAL DAILY NET LOSS LIMIT REACHED]", notifier.messages[0])
+        self.assertIn("-60.2500 USDT", notifier.messages[0])
+
+    def test_global_daily_net_loss_is_reconstructed_from_trade_database(self):
+        with TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            database = Path(tmpdir) / "trades.sqlite3"
+            env = {
+                "BN_STRA_STATE_FILE": str(state_file),
+                "BN_STRA_TRADE_DB": str(database),
+            }
+            config = replace(test_config(False), global_daily_net_loss_limit=Decimal("60"))
+            with patch.dict("os.environ", env):
+                first = BnStraHighRisk1(config, FakeClient([]))
+                opened_at_ms = int(time.time() * 1000) - 60_000
+                first.trade_store.record_open(
+                    "real", "ETHUSDT", "long", 5, opened_at_ms,
+                    Decimal("100"), Decimal("1"), Decimal("100"),
+                    Decimal("98"), Decimal("100"),
+                )
+                first.trade_store.record_close(
+                    "real", "ETHUSDT", opened_at_ms, Decimal("98"),
+                    Decimal("100"), Decimal("98"), "stop_loss",
+                    Decimal("-59"), Decimal("-2"), Decimal("0"),
+                    Decimal("-61"), Decimal("-61"), Decimal("1"),
+                )
+                restarted = BnStraHighRisk1(config, FakeClient([]))
+
+        self.assertEqual(restarted.global_daily_net_pnl, Decimal("-61"))
+        self.assertTrue(restarted.global_entries_paused())
 
     def test_concurrent_position_limit_blocks_new_entries(self):
         config = replace(

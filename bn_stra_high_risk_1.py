@@ -16,7 +16,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, getcontext
 from pathlib import Path
 from typing import Any
@@ -100,6 +100,7 @@ class BotConfig:
     hermes_target: str = "weixin"
     paper_signals_after_global_stop: bool = False
     paper_trading_only: bool = False
+    global_daily_net_loss_limit: Decimal = Decimal("0")
     entry_signal_max_distance_pct: Decimal = Decimal("0.003")
     entry_signal_max_atr_factor: Decimal = Decimal("0.25")
     dynamic_universe_enabled: bool = False
@@ -185,6 +186,9 @@ class BotConfig:
             hermes_target=str(raw.get("hermes_target", "weixin")),
             paper_signals_after_global_stop=bool(raw.get("paper_signals_after_global_stop", False)),
             paper_trading_only=bool(raw.get("paper_trading_only", False)),
+            global_daily_net_loss_limit=Decimal(
+                str(raw.get("global_daily_net_loss_limit", "0"))
+            ),
             entry_signal_max_distance_pct=Decimal(
                 str(raw.get("entry_signal_max_distance_pct", "0.003"))
             ),
@@ -284,6 +288,8 @@ class BotConfig:
             raise ValueError("daily_stop_limit must be positive")
         if self.global_daily_stop_limit < 0:
             raise ValueError("global_daily_stop_limit cannot be negative")
+        if self.global_daily_net_loss_limit < 0:
+            raise ValueError("global_daily_net_loss_limit cannot be negative")
         if self.entry_signal_max_distance_pct <= 0:
             raise ValueError("entry_signal_max_distance_pct must be positive")
         if self.entry_signal_max_atr_factor <= 0:
@@ -614,6 +620,23 @@ class TradeStore:
         except sqlite3.Error as exc:
             logging.error("Trade database close write failed for %s: %s", key, exc)
 
+    def closed_net_pnl(self, mode: str, start_ms: int, end_ms: int) -> Decimal:
+        if self.connection is None:
+            return Decimal("0")
+        try:
+            rows = self.connection.execute(
+                """
+                SELECT net_pnl FROM trades
+                WHERE mode=? AND status='closed' AND closed_at_ms>=? AND closed_at_ms<?
+                    AND net_pnl IS NOT NULL
+                """,
+                (mode, start_ms, end_ms),
+            ).fetchall()
+            return sum((Decimal(str(row[0])) for row in rows), Decimal("0"))
+        except (sqlite3.Error, ArithmeticError, ValueError) as exc:
+            logging.error("Trade database daily net PnL query failed: %s", exc)
+            return Decimal("0")
+
     def _record_event(
         self,
         trade_key: str,
@@ -745,11 +768,15 @@ class BnStraHighRisk1:
         )
         self.global_daily_stop_day = datetime.now(self.tz).strftime("%Y-%m-%d")
         self.global_daily_stop_count = 0
+        self.global_daily_net_pnl = Decimal("0")
         self.global_limit_logged = False
         self.global_limit_notified = False
+        self.global_net_loss_limit_logged = False
+        self.global_net_loss_limit_notified = False
         self.position_limit_logged = False
         self.paper_positions: dict[str, PaperPosition] = {}
         self.load_runtime_state()
+        self.refresh_global_daily_net_pnl()
         for position in self.paper_positions.values():
             self.record_paper_open(position)
 
@@ -933,20 +960,48 @@ class BnStraHighRisk1:
             self.open_position(symbol, signal, stop_distance_pct)
 
     def global_entries_paused(self) -> bool:
+        return self.stop_count_entries_paused() or self.net_loss_entries_paused()
+
+    def stop_count_entries_paused(self) -> bool:
         return bool(
             self.config.global_daily_stop_limit
             and self.global_daily_stop_count > self.config.global_daily_stop_limit
         )
 
+    def net_loss_entries_paused(self) -> bool:
+        return bool(
+            self.config.global_daily_net_loss_limit
+            and self.global_daily_net_pnl <= -self.config.global_daily_net_loss_limit
+        )
+
+    def refresh_global_daily_net_pnl(self) -> None:
+        now = datetime.now(self.tz)
+        start = datetime(now.year, now.month, now.day, tzinfo=self.tz)
+        end = start + timedelta(days=1)
+        self.global_daily_net_pnl = self.trade_store.closed_net_pnl(
+            "real", int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+        )
+
     def log_and_notify_global_pause(self) -> None:
-        if not self.global_limit_logged:
+        if self.stop_count_entries_paused() and not self.global_limit_logged:
             logging.warning(
                 "Global daily stop limit exceeded: count=%s limit=%s; real entries paused until next day",
                 self.global_daily_stop_count,
                 self.config.global_daily_stop_limit,
             )
             self.global_limit_logged = True
-        self.notify_global_daily_stop_limit()
+        if self.stop_count_entries_paused():
+            self.notify_global_daily_stop_limit()
+        if self.net_loss_entries_paused() and not self.global_net_loss_limit_logged:
+            logging.warning(
+                "Global daily net loss limit reached: net_pnl=%s loss_limit=%s; "
+                "real entries paused until next day",
+                self.global_daily_net_pnl,
+                self.config.global_daily_net_loss_limit,
+            )
+            self.global_net_loss_limit_logged = True
+        if self.net_loss_entries_paused():
+            self.notify_global_daily_net_loss_limit()
 
     def entry_limits_allow(self, state: PositionState) -> bool:
         if self.global_entries_paused():
@@ -1578,6 +1633,9 @@ class BnStraHighRisk1:
             pnl_summary["realized"], pnl_summary["commission"], pnl_summary["funding"],
             pnl_summary["net"], pnl_summary["roi"], close_qty,
         )
+        self.refresh_global_daily_net_pnl()
+        if self.net_loss_entries_paused():
+            self.notify_global_daily_net_loss_limit()
         state.side = None
         state.entry_price = Decimal("0")
         state.quantity = Decimal("0")
@@ -1609,6 +1667,24 @@ class BnStraHighRisk1:
                     f"- Confirmed initial stop losses: {self.global_daily_stop_count}",
                     f"- Allowed before pause: {self.config.global_daily_stop_limit}",
                     "- New entries are paused until the next Asia/Shanghai day.",
+                    "- Existing positions remain protected and managed.",
+                    "- Qualified signals will be tracked as paper trades when enabled.",
+                ]
+            )
+        )
+
+    def notify_global_daily_net_loss_limit(self) -> None:
+        if self.global_net_loss_limit_notified:
+            return
+        self.global_net_loss_limit_notified = True
+        self.save_runtime_state()
+        self.notifier.send(
+            "\n".join(
+                [
+                    "[GLOBAL DAILY NET LOSS LIMIT REACHED]",
+                    f"- Realized net PnL today: {self.global_daily_net_pnl:+.4f} USDT",
+                    f"- Maximum daily net loss: {self.config.global_daily_net_loss_limit:.4f} USDT",
+                    "- New real entries are paused until the next Asia/Shanghai day.",
                     "- Existing positions remain protected and managed.",
                     "- Qualified signals will be tracked as paper trades when enabled.",
                 ]
@@ -2262,8 +2338,11 @@ class BnStraHighRisk1:
         if self.global_daily_stop_day != today:
             self.global_daily_stop_day = today
             self.global_daily_stop_count = 0
+            self.global_daily_net_pnl = Decimal("0")
             self.global_limit_logged = False
             self.global_limit_notified = False
+            self.global_net_loss_limit_logged = False
+            self.global_net_loss_limit_notified = False
             changed = True
         if state.daily_stop_day != today:
             state.daily_stop_day = today
@@ -2292,9 +2371,13 @@ class BnStraHighRisk1:
                     else sum(max(0, int(value)) for value in counts.values())
                 )
                 self.global_limit_notified = bool(data.get("global_limit_notified", False))
+                self.global_net_loss_limit_notified = bool(
+                    data.get("global_net_loss_limit_notified", False)
+                )
             else:
                 self.global_daily_stop_count = 0
                 self.global_limit_notified = False
+                self.global_net_loss_limit_notified = False
             for symbol, state in self.states.items():
                 state.daily_stop_count = max(0, int(counts.get(symbol, 0)))
             cooldowns = data.get("cooldown_until", {})
@@ -2369,7 +2452,9 @@ class BnStraHighRisk1:
         data = {
             "day": today,
             "global_daily_stop_count": self.global_daily_stop_count,
+            "global_daily_net_pnl": format_decimal(self.global_daily_net_pnl),
             "global_limit_notified": self.global_limit_notified,
+            "global_net_loss_limit_notified": self.global_net_loss_limit_notified,
             "daily_stop_counts": {
                 symbol: state.daily_stop_count
                 for symbol, state in self.states.items()
