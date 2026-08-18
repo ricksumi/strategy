@@ -865,6 +865,8 @@ class BnStraHighRisk1Tests(unittest.TestCase):
                 bot = BnStraHighRisk1(test_config(False), FakeClient([]))
 
             self.assertEqual(bot.global_daily_stop_count, 5)
+            self.assertEqual(bot.states["OLDUSDT"].daily_stop_count, 3)
+            self.assertIn("OLDUSDT", bot.managed_symbols)
 
     def test_global_daily_stop_limit_blocks_new_entries(self):
         with TemporaryDirectory() as tmpdir, patch.dict(

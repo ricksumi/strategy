@@ -2378,6 +2378,11 @@ class BnStraHighRisk1:
                 self.global_daily_stop_count = 0
                 self.global_limit_notified = False
                 self.global_net_loss_limit_notified = False
+            for symbol in counts:
+                if symbol not in self.states:
+                    self.states[symbol] = PositionState(symbol=symbol)
+                if symbol not in self.managed_symbols:
+                    self.managed_symbols.append(symbol)
             for symbol, state in self.states.items():
                 state.daily_stop_count = max(0, int(counts.get(symbol, 0)))
             cooldowns = data.get("cooldown_until", {})
