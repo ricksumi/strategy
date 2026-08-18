@@ -867,6 +867,8 @@ class BnStraHighRisk1Tests(unittest.TestCase):
             self.assertEqual(bot.global_daily_stop_count, 5)
             self.assertEqual(bot.states["OLDUSDT"].daily_stop_count, 3)
             self.assertIn("OLDUSDT", bot.managed_symbols)
+            bot.reset_daily_counter_if_needed(bot.states["OLDUSDT"])
+            self.assertEqual(bot.states["OLDUSDT"].daily_stop_count, 3)
 
     def test_global_daily_stop_limit_blocks_new_entries(self):
         with TemporaryDirectory() as tmpdir, patch.dict(

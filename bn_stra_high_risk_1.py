@@ -2384,6 +2384,7 @@ class BnStraHighRisk1:
                 if symbol not in self.managed_symbols:
                     self.managed_symbols.append(symbol)
             for symbol, state in self.states.items():
+                state.daily_stop_day = today
                 state.daily_stop_count = max(0, int(counts.get(symbol, 0)))
             cooldowns = data.get("cooldown_until", {})
             if not isinstance(cooldowns, dict):
