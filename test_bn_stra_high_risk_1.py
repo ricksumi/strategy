@@ -932,6 +932,9 @@ class BnStraHighRisk1Tests(unittest.TestCase):
         self.assertIn("[GLOBAL DAILY NET LOSS LIMIT REACHED]", notifier.messages[0])
         self.assertIn("-60.2500 USDT", notifier.messages[0])
 
+        bot.global_daily_net_pnl = Decimal("-50")
+        self.assertTrue(bot.global_entries_paused())
+
     def test_global_daily_net_loss_is_reconstructed_from_trade_database(self):
         with TemporaryDirectory() as tmpdir:
             state_file = Path(tmpdir) / "state.json"

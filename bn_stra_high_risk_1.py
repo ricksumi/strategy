@@ -971,7 +971,10 @@ class BnStraHighRisk1:
     def net_loss_entries_paused(self) -> bool:
         return bool(
             self.config.global_daily_net_loss_limit
-            and self.global_daily_net_pnl <= -self.config.global_daily_net_loss_limit
+            and (
+                self.global_net_loss_limit_notified
+                or self.global_daily_net_pnl <= -self.config.global_daily_net_loss_limit
+            )
         )
 
     def refresh_global_daily_net_pnl(self) -> None:
