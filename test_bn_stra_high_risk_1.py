@@ -9,6 +9,10 @@ from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+_TEST_RUNTIME_DIR = TemporaryDirectory()
+os.environ["BN_STRA_STATE_FILE"] = str(Path(_TEST_RUNTIME_DIR.name) / "state.json")
+os.environ["BN_STRA_TRADE_DB"] = str(Path(_TEST_RUNTIME_DIR.name) / "trades.sqlite3")
+
 from bn_stra_high_risk_1 import (
     BinanceClient,
     BnStraHighRisk1,
