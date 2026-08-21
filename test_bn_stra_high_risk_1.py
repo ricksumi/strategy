@@ -457,6 +457,21 @@ class BnStraHighRisk1Tests(unittest.TestCase):
 
         fetch_candles.assert_not_called()
 
+    def test_non_entry_paper_position_is_still_managed(self):
+        bot = BnStraHighRisk1(test_config(False), FakeClient([]))
+        bot.states["OLDUSDT"] = PositionState(symbol="OLDUSDT")
+        bot.states["OLDUSDT"].daily_stop_day = bot.global_daily_stop_day
+        bot.managed_symbols.append("OLDUSDT")
+        paper_position = object()
+        bot.paper_positions["OLDUSDT"] = paper_position
+
+        with patch.object(bot, "get_position", return_value={"positionAmt": "0"}), patch.object(
+            bot, "get_mark_price", return_value=Decimal("1")
+        ), patch.object(bot, "manage_paper_position") as manage:
+            bot.tick_symbol("OLDUSDT")
+
+        manage.assert_called_once_with(paper_position, Decimal("1"))
+
     def test_config_accepts_5m_interval(self):
         config = test_config(False, interval="5m")
 

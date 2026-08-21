@@ -843,12 +843,12 @@ class BnStraHighRisk1:
         if state.quantity != 0:
             self.on_position_closed(state)
 
-        if symbol not in self.entry_symbols and state.pending_signal_side is None:
-            return
-
         paper_position = self.paper_positions.get(symbol)
         if paper_position is not None:
             self.manage_paper_position(paper_position, self.get_mark_price(symbol))
+            return
+
+        if symbol not in self.entry_symbols and state.pending_signal_side is None:
             return
 
         global_paused = self.global_entries_paused()
