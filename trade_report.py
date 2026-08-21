@@ -17,7 +17,11 @@ TIMEZONE = ZoneInfo("Asia/Shanghai")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=".bn-stra-high-risk-1-trades.sqlite3")
-    parser.add_argument("--date", help="Opening date in Asia/Shanghai, for example 2026-08-14")
+    dates = parser.add_mutually_exclusive_group()
+    dates.add_argument("--date", help="Deprecated alias for --opened-date")
+    dates.add_argument("--opened-date", help="Opening date in Asia/Shanghai, for example 2026-08-14")
+    dates.add_argument("--closed-date", help="Closing date in Asia/Shanghai")
+    dates.add_argument("--pnl-date", help="Realized PnL date in Asia/Shanghai (uses closing time)")
     parser.add_argument("--status", choices=("open", "closed"))
     parser.add_argument("--symbol")
     parser.add_argument("--limit", type=int, default=100)
@@ -31,11 +35,17 @@ def main() -> None:
     connection.row_factory = sqlite3.Row
     clauses: list[str] = []
     values: list[object] = []
-    if args.date:
-        start = datetime.strptime(args.date, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
+    selected_date = args.date or args.opened_date or args.closed_date or args.pnl_date
+    order_column = "opened_at_ms"
+    if selected_date:
+        start = datetime.strptime(selected_date, "%Y-%m-%d").replace(tzinfo=TIMEZONE)
         end = start.replace(hour=23, minute=59, second=59, microsecond=999999)
-        clauses.append("opened_at_ms BETWEEN ? AND ?")
+        date_column = "closed_at_ms" if args.closed_date or args.pnl_date else "opened_at_ms"
+        clauses.append(f"{date_column} BETWEEN ? AND ?")
         values.extend((int(start.timestamp() * 1000), int(end.timestamp() * 1000)))
+        order_column = date_column
+    if args.pnl_date:
+        clauses.append("status = 'closed'")
     if args.status:
         clauses.append("status = ?")
         values.append(args.status)
@@ -48,7 +58,7 @@ def main() -> None:
         f"""
         SELECT * FROM trades
         {where}
-        ORDER BY opened_at_ms DESC
+        ORDER BY {order_column} DESC
         LIMIT ?
         """,
         values,
@@ -61,13 +71,13 @@ def main() -> None:
         print(json.dumps(items, indent=2, ensure_ascii=False))
         return
 
-    print("opened_at           mode  symbol          side   status  entry          exit           net_pnl     roi       reason")
-    print("-" * 116)
+    print("opened_at           closed_at           mode  symbol          side   status  entry          exit           net_pnl     roi       reason")
+    print("-" * 136)
     for item in items:
         net_pnl = format_metric(item["net_pnl"])
         roi = format_metric(item["margin_roi"])
         print(
-            f"{item['opened_at']:<19} {item['mode']:<5} {item['symbol']:<15} "
+            f"{item['opened_at']:<19} {item['closed_at']:<19} {item['mode']:<5} {item['symbol']:<15} "
             f"{item['side']:<6} {item['status']:<7} {item['entry_price']:<14} "
             f"{(item['exit_price'] or '-'):<14} {net_pnl:<11} "
             f"{roi:<9} {item['close_reason'] or '-'}"

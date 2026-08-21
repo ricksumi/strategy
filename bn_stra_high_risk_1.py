@@ -758,6 +758,7 @@ class BnStraHighRisk1:
         self.next_universe_refresh = 0.0
         self.leverage_symbols: set[str] = set()
         self.candle_cache: dict[tuple[str, str, int], tuple[float, list[Candle]]] = {}
+        self.entry_gate_cache: dict[str, tuple[int, str]] = {}
         self.tz = ZoneInfo("Asia/Shanghai")
         self.state_path = Path(os.environ.get("BN_STRA_STATE_FILE", ".bn-stra-high-risk-1-state.json"))
         self.trade_store = TradeStore(os.environ.get("BN_STRA_TRADE_DB", config.trade_db_path))
@@ -875,6 +876,10 @@ class BnStraHighRisk1:
         if signal == "none":
             self.clear_pending_signal(state)
             return
+        candle_close_time = candles[-1].close_time
+        cached_gate = self.entry_gate_cache.get(symbol)
+        if cached_gate is not None and cached_gate[0] == candle_close_time:
+            return
         signal_price = candles[-1].close
         if state.rejected_signal_side == signal and state.rejected_signal_price == signal_price:
             return
@@ -887,6 +892,7 @@ class BnStraHighRisk1:
             ema = ema_values([c.close for c in candles], self.config.ema_fast)[-1]
             distance_pct = abs(close - ema) / close if ema is not None and close > 0 else Decimal("0")
             distance_limit_pct = (atr_pct or Decimal("0")) * self.config.max_ema_atr_distance
+            self.entry_gate_cache[symbol] = (candle_close_time, "ema_distance")
             logging.info(
                 "%s signal=%s blocked: price too far from EMA%s "
                 "price=%s ema=%s distance=%.3f%% limit=%.3f%% atr=%.3f%% max_atr_distance=%s",
@@ -915,6 +921,7 @@ class BnStraHighRisk1:
                 self.config.top_long_veto_max,
                 self.config.top_short_veto_min,
             ):
+                self.entry_gate_cache[symbol] = (candle_close_time, "contract_positioning")
                 logging.info(
                     "%s signal=%s blocked: contract positioning global_ls=%s top_position_ls=%s",
                     symbol,
@@ -1631,7 +1638,7 @@ class BnStraHighRisk1:
         self.cancel_algo_open_orders(state.symbol)
         pnl_summary = self.notify_position_closed(state, close_opened_at_ms, close_margin)
         self.trade_store.record_close(
-            "real", state.symbol, close_opened_at_ms, None, close_best_price,
+            "real", state.symbol, close_opened_at_ms, pnl_summary["exit_price"], close_best_price,
             close_stop_price, state.stop_reason,
             pnl_summary["realized"], pnl_summary["commission"], pnl_summary["funding"],
             pnl_summary["net"], pnl_summary["roi"], close_qty,
@@ -1725,6 +1732,7 @@ class BnStraHighRisk1:
         realized = Decimal("0")
         commission = Decimal("0")
         funding = Decimal("0")
+        exit_price: Decimal | None = None
         complete = False
         if not self.config.dry_run and opened_at_ms > 0:
             try:
@@ -1745,6 +1753,20 @@ class BnStraHighRisk1:
                 complete = True
             except Exception as exc:
                 logging.warning("%s PnL summary query failed: %s", state.symbol, exc)
+            try:
+                trade_rows = self.client.signed_request(
+                    "GET",
+                    "/fapi/v1/userTrades",
+                    {
+                        "symbol": state.symbol,
+                        "startTime": max(0, opened_at_ms - 5000),
+                        "endTime": now_ms,
+                        "limit": 1000,
+                    },
+                )
+                exit_price = weighted_exit_fill_price(trade_rows, state.side)
+            except Exception as exc:
+                logging.warning("%s exit fill summary query failed: %s", state.symbol, exc)
         net = realized + commission + funding
         roi = (net / initial_margin * Decimal("100")) if complete and initial_margin > 0 else None
         duration = max(0, (now_ms - opened_at_ms) // 1000) if opened_at_ms else 0
@@ -1756,6 +1778,7 @@ class BnStraHighRisk1:
                     f"[CLOSED] {state.symbol} {(state.side or 'unknown').upper()}",
                     f"- Reason: {state.stop_reason}",
                     f"- Entry: {format_decimal(state.entry_price)}",
+                    f"- Exit: {format_decimal(exit_price) if exit_price is not None else 'unavailable'}",
                     f"- Quantity: {format_decimal(state.quantity)}",
                     f"- Realized PnL: {realized:+.4f} USDT" if complete else "- Realized PnL: unavailable",
                     f"- Commission: {commission:+.4f} USDT" if complete else "- Commission: unavailable",
@@ -1767,6 +1790,7 @@ class BnStraHighRisk1:
             )
         )
         return {
+            "exit_price": exit_price,
             "realized": realized if complete else None,
             "commission": commission if complete else None,
             "funding": funding if complete else None,
@@ -2865,6 +2889,26 @@ def round_stop_price(price: Decimal, tick_size: Decimal, side: str) -> Decimal:
 
 def round_to_step(value: Decimal, step_size: Decimal) -> Decimal:
     return (value / step_size).to_integral_value(rounding=ROUND_DOWN) * step_size
+
+
+def weighted_exit_fill_price(
+    trades: list[dict[str, Any]], position_side: str | None
+) -> Decimal | None:
+    closing_side = "SELL" if position_side == "long" else "BUY" if position_side == "short" else None
+    if closing_side is None:
+        return None
+    total_quantity = Decimal("0")
+    total_notional = Decimal("0")
+    for trade in trades:
+        if str(trade.get("side", "")).upper() != closing_side:
+            continue
+        quantity = Decimal(str(trade.get("qty", "0")))
+        price = Decimal(str(trade.get("price", "0")))
+        if quantity <= 0 or price <= 0:
+            continue
+        total_quantity += quantity
+        total_notional += quantity * price
+    return total_notional / total_quantity if total_quantity > 0 else None
 
 
 def gross_pnl(entry_price: Decimal, exit_price: Decimal, quantity: Decimal, side: str) -> Decimal:

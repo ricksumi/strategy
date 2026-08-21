@@ -42,10 +42,22 @@ from bn_stra_high_risk_1 import (
     strategy_signal,
     stop_improved_by,
     trailing_callback_for_roi,
+    weighted_exit_fill_price,
 )
 
 
 class BnStraHighRisk1Tests(unittest.TestCase):
+    def test_weighted_exit_fill_price_uses_only_closing_side(self):
+        trades = [
+            {"side": "BUY", "price": "100", "qty": "5"},
+            {"side": "SELL", "price": "110", "qty": "2"},
+            {"side": "SELL", "price": "120", "qty": "3"},
+        ]
+
+        self.assertEqual(weighted_exit_fill_price(trades, "long"), Decimal("116"))
+        self.assertEqual(weighted_exit_fill_price(trades, "short"), Decimal("100"))
+        self.assertIsNone(weighted_exit_fill_price(trades, None))
+
     def test_active_universe_filters_and_ranks_markets(self):
         now_ms = 2_000_000_000_000
         old = now_ms - 60 * 86_400_000

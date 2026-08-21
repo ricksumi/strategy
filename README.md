@@ -280,16 +280,18 @@ best price, stops, realized PnL, commission, funding, net PnL, ROI, duration, an
 The `trade_events` table stores open, partial take-profit, stop-move, and close events. A stable
 trade key prevents a restored position from being inserted twice after a restart.
 
-Read today's trades without calling Binance:
+Read trades opened today without calling Binance (`--date` remains a compatible alias):
 
 ```bash
-python3 trade_report.py --date "$(date +%F)"
+python3 trade_report.py --opened-date "$(date +%F)"
 ```
 
 Other examples:
 
 ```bash
+python3 trade_report.py --pnl-date "$(date +%F)"
+python3 trade_report.py --closed-date 2026-08-14
 python3 trade_report.py --status open
 python3 trade_report.py --symbol SNDKUSDT --limit 50
-python3 trade_report.py --date 2026-08-14 --json
+python3 trade_report.py --pnl-date 2026-08-14 --json
 ```
