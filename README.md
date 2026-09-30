@@ -1,4 +1,13 @@
-# bn-stra-high-risk-1
+# Binance Trading Strategies
+
+The unified strategy platform is maintained in
+[`bn-strategy-platform/`](bn-strategy-platform/README.md). It contains the shared
+execution, risk management, MySQL persistence, notifications, deployment files,
+and [individual strategy documentation](bn-strategy-platform/docs/strategies/README.md).
+
+The standalone bot below is retained as legacy code.
+
+## bn-stra-high-risk-1
 
 `bn-stra-high-risk-1` is a high-risk Binance USD-M Futures trading bot. It targets volatile perpetual contracts and uses trend, volatility, pullback, and reversal-confirmation filters before opening a position.
 

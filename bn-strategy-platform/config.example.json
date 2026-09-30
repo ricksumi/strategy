@@ -1,0 +1,61 @@
+{
+  "mode": "shadow",
+  "allow_live": false,
+  "poll_seconds": 15,
+  "universe_refresh_seconds": 300,
+  "max_positions": 5,
+  "hard_max_positions": 7,
+  "position_rotation_enabled": false,
+  "rotation_min_new_score": "80",
+  "rotation_min_score_advantage": "15",
+  "rotation_min_hold_minutes": 90,
+  "rotation_max_best_r": "0.75",
+  "rotation_max_current_r": "0.25",
+  "rotation_max_loss_r": "0.5",
+  "rotation_cooldown_minutes": 60,
+  "leverage": 3,
+  "margin_per_trade_usdt": "200",
+  "risk_per_trade_usdt": "20",
+  "max_daily_loss_usdt": "60",
+  "max_open_risk_usdt": "60",
+  "max_directional_open_risk_usdt": "45",
+  "paper_equity_usdt": "1000",
+  "paper_on_position_limit": false,
+  "entry_slippage": "0.002",
+  "exit_slippage": "0.003",
+  "fee_rate": "0.0005",
+  "database_backend": "mysql",
+  "state_path": "runtime/platform-state.json",
+  "notify_targets": ["weixin", "telegram"],
+  "strategies": [
+    {
+      "name": "momentum-long",
+      "enabled": true,
+      "settings": {
+        "active_symbol_limit": 30,
+        "min_quote_volume": "15000000",
+        "min_adx": "25"
+      }
+    },
+    {
+      "name": "exhaustion-short",
+      "enabled": true,
+      "settings": {
+        "active_symbol_limit": 30,
+        "min_quote_volume": "15000000"
+      }
+    },
+    {
+      "name": "copy-lead",
+      "enabled": false,
+      "settings": {
+        "portfolio_id": "5075281354358777856",
+        "margin_per_trade": "50",
+        "min_lead_notional": "1000",
+        "max_entry_delay_seconds": 300,
+        "event_not_before_ms": 0,
+        "leverage": 3
+      }
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+[Unit]
+Description=Unified Binance strategy platform
+After=network-online.target mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/bn-strategy-platform
+EnvironmentFile=%h/bn-strategy-platform/.env
+EnvironmentFile=%h/mysql-trade.env
+Environment=HERMES_SOCKET_PATH=%h/apps/hermes-work/hermes-work.sock
+Environment=PYTHONPATH=%h/bn-strategy-platform/src
+ExecStart=/usr/bin/python3 -m bn_strategy_platform.apps.run_strategy --config config.json --env-file .env --confirm-live
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

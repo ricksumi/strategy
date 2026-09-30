@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bn-strategy-platform"
+version = "1.15.0"
+description = "Shared Binance USD-M strategy runtime"
+requires-python = ">=3.10"
+dependencies = ["PyMySQL>=1.1.0,<2"]
+
+[project.scripts]
+bn-strategy = "bn_strategy_platform.apps.run_strategy:main"
+bn-account-status = "bn_strategy_platform.apps.account_status:main"
+bn-platform-status = "bn_strategy_platform.apps.platform_status:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
