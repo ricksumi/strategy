@@ -131,7 +131,10 @@ class TradingEngine:
             self.position_limit_paper_manager.manage_all(self.strategy_map)
         self._refresh_unmanaged_live_positions()
         for strategy in self.event_strategies:
-            self._scan_events(strategy)
+            try:
+                self._scan_events(strategy)
+            except Exception:
+                logging.exception("event strategy scan failed strategy=%s", strategy.name)
         live_entries: list[PendingEntry] = []
         for runtime in self.runtimes:
             if getattr(runtime.strategy, "background_universe_refresh", False):
@@ -562,6 +565,7 @@ class TradingEngine:
             if self.store.event_seen(event.event_id, event.strategy, mode.value):
                 continue
             try:
+                decision, reason = "processed", ""
                 if event.kind == "open" and event.signal is not None:
                     if mode is RunMode.LIVE and event.symbol in self.unmanaged_live_symbols:
                         logging.warning(
@@ -572,6 +576,8 @@ class TradingEngine:
                         self.store.save_event(
                             event, "processed", mode.value, strategy.version,
                         )
+                        self._record_event_decision(strategy, event, "blocked",
+                                                    "unmanaged Binance position")
                         continue
                     gate = getattr(strategy, "event_entry_block_reason", None)
                     block_reason = gate(event, mode.value) if gate is not None else None
@@ -583,10 +589,12 @@ class TradingEngine:
                         self.store.save_event(
                             event, "processed", mode.value, strategy.version,
                         )
+                        self._record_event_decision(strategy, event, "blocked", block_reason)
                         continue
                     self.store.save_signal(event.signal, mode.value)
                     if mode is RunMode.SHADOW:
                         self.notifier.send(self.signal_message(event.signal))
+                        decision = "shadow_signal"
                     elif ((event.strategy, event.symbol) not in active_positions
                           and (mode is not RunMode.LIVE
                                or not any(position.symbol == event.symbol
@@ -594,7 +602,12 @@ class TradingEngine:
                         if execution is None:
                             raise RuntimeError(f"no execution service for {mode.value}")
                         execution.open(event.signal)
+                        decision = "opened"
+                    else:
+                        decision, reason = "blocked", "position already open"
                 elif event.kind == "close":
+                    decision = "close_ignored"
+                    reason = "no matching followed position"
                     for position in list(active_positions.values()):
                         if (position.strategy == event.strategy and position.symbol == event.symbol
                                 and position.side is event.side):
@@ -602,13 +615,17 @@ class TradingEngine:
                                 raise RuntimeError(f"no execution service for {mode.value}")
                             execution.close(position, position.remaining_quantity, "lead_close",
                                             self.market.mark_price(position.symbol))
+                            decision, reason = "closed", "lead_close"
                 elif event.kind.startswith("skip_"):
+                    decision, reason = "skipped", event.kind.removeprefix("skip_")
                     logging.info(
                         "event skipped strategy=%s symbol=%s reason=%s event_id=%s",
                         event.strategy, event.symbol, event.kind, event.event_id,
                     )
                 self.store.save_event(event, "processed", mode.value, strategy.version)
+                self._record_event_decision(strategy, event, decision, reason)
             except ValueError as exc:
+                self._record_event_decision(strategy, event, "blocked", str(exc))
                 if (mode is RunMode.LIVE and event.signal is not None
                         and self._is_allocation_limit(exc)):
                     self._open_position_limit_paper(event.signal)
@@ -628,8 +645,19 @@ class TradingEngine:
                         event, "error", mode.value, strategy.version
                     )
             except Exception:
+                self._record_event_decision(strategy, event, "error", "event execution failed")
                 logging.exception("external event failed strategy=%s symbol=%s", event.strategy, event.symbol)
                 self.store.save_event(event, "error", mode.value, strategy.version)
+
+    @staticmethod
+    def _record_event_decision(strategy, event, decision: str, reason: str) -> None:
+        recorder = getattr(strategy, "record_event_decision", None)
+        if recorder is not None:
+            try:
+                recorder(event, decision, reason)
+            except Exception:
+                logging.exception("event audit update failed strategy=%s event_id=%s",
+                                  strategy.name, event.event_id)
 
     def _refresh_unmanaged_live_positions(self) -> None:
         if self.config.mode is not RunMode.LIVE:

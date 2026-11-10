@@ -8,7 +8,7 @@ Binance USD-M Futures runtime.
 | [`bn-stra-top-gainers-1`](bn-stra-top-gainers-1.md) | Short | Candle-driven momentum exhaustion | `3.12.0`, or `3.13.0` with confirmation pullback enabled |
 | [`bn-stra-top-gainers-exhaustion-short-1`](bn-stra-top-gainers-exhaustion-short-1.md) | Long | Candle-driven exhaustion reclaim | `4.10.0`, or `4.11.0` with confirmation pullback enabled |
 | [`cz-gainers-long`](cz-gainers-long.md) | Long | Top-three filtered four-hour momentum pullback | `2.3.0` |
-| [`bn-stra-copy-lead-1`](bn-stra-copy-lead-1.md) | Lead direction | Event-driven copy strategy | `2.4.0` |
+| [`bn-stra-copy-lead-1`](bn-stra-copy-lead-1.md) | Lead direction | Event-driven copy strategy | `2.5.0` |
 | [`bn-stra-fast-stop-reversal-1`](bn-stra-fast-stop-reversal-1.md) | Opposite pullback trade | Structured fast-stop reversal | `1.3.0` |
 | [`bn-stra-momentum-ignition-long-1`](bn-stra-momentum-ignition-long-1.md) | Long | Flow-confirmed momentum ignition pullback | `1.0.0` |
 

@@ -20,6 +20,7 @@ class MemoryTradeStore:
         self.fast_stop_candidates: list[ClosedTrade] = []
         self.closed_trades: list[ClosedTrade] = []
         self.open_metrics: dict[str, dict] = {}
+        self.lead_orders: dict[tuple[str, str, str, str], dict] = {}
 
     def load_open_positions(self, strategy: str, mode: str) -> list[Position]:
         return [item for item in self.positions.values()
@@ -124,6 +125,25 @@ class MemoryTradeStore:
 
     def save_event(self, event: StrategyEvent, status: str, mode: str, version: str) -> None:
         self.events[(event.strategy, mode, event.event_id)] = status
+
+    def observe_lead_order(self, strategy, version, mode, portfolio_id, event,
+                           raw_order, seen_at_ms, previously_processed=False) -> None:
+        key = (strategy, mode, portfolio_id, event.event_id)
+        record = self.lead_orders.setdefault(key, {
+            "strategy_version": version, "first_seen_at_ms": seen_at_ms,
+            "observed_at_ms": event.observed_at_ms,
+            "first_seen_delay_ms": max(0, seen_at_ms - event.observed_at_ms),
+            "decision": "previously_processed" if previously_processed else "observed",
+            "reason": "", "metrics": {},
+        })
+        record.update(last_seen_at_ms=seen_at_ms, raw_order=dict(raw_order))
+
+    def decide_lead_order(self, strategy, mode, portfolio_id, event_id,
+                          decision, reason, metrics) -> None:
+        record = self.lead_orders[(strategy, mode, portfolio_id, event_id)]
+        record.update(decision=decision, reason=reason)
+        if metrics is not None:
+            record["metrics"] = dict(metrics)
 
     def close(self) -> None:
         pass

@@ -71,7 +71,8 @@ def main() -> None:
     socket_path = os.environ.get("HERMES_SOCKET_PATH", "")
     notifier = HermesNotifier(socket_path, config.notify_targets) if socket_path else LoggingNotifier()
     plugins = [build_strategy(
-        item.name, item.settings, config.strategy_risk(item.name).leverage, store
+        item.name, item.settings, config.strategy_risk(item.name).leverage, store,
+        mode=config.strategy_mode(item.name).value,
     )
                for item in config.strategies if item.enabled]
     strategies = [item for item in plugins if not hasattr(item, "poll_events")]

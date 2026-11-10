@@ -17,15 +17,16 @@ from .top_gainers import TopGainersSettings, TopGainersStrategy
 
 def build_strategy(
     name: str, settings: Mapping[str, Any], leverage: int = 5, store: Any = None,
+    mode: str = "paper",
 ) -> StrategyPort | EventStrategyPort:
     if name == "copy-lead":
         merged = dict(settings)
         merged["leverage"] = leverage
-        return CopyLeadStrategy(CopyLeadSettings.from_mapping(merged), store)
+        return CopyLeadStrategy(CopyLeadSettings.from_mapping(merged), store, mode)
     if name == "bn-stra-copy-lead-1":
         merged = dict(settings)
         merged["leverage"] = leverage
-        strategy = CopyLeadStrategy(CopyLeadSettings.from_mapping(merged), store)
+        strategy = CopyLeadStrategy(CopyLeadSettings.from_mapping(merged), store, mode)
         strategy.name = name
         return strategy
     if name == "cz-gainers-long":

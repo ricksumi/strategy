@@ -7,6 +7,11 @@ from bn_strategy_platform.strategies.registry import build_strategy
 
 
 class RegistryTests(unittest.TestCase):
+    def test_copy_lead_audit_uses_configured_run_mode(self) -> None:
+        strategy = build_strategy("bn-stra-copy-lead-1", {"portfolio_id": "123"}, mode="live")
+        self.assertEqual(strategy.mode, "live")
+        self.assertEqual(strategy.version, "2.5.0")
+
     def test_long_and_short_are_explicit_plugins(self) -> None:
         long_strategy = build_strategy("momentum-long", {})
         short_strategy = build_strategy("exhaustion-short", {})
@@ -65,7 +70,7 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(pullback.settings.model, "exhaustion_pullback_long")
         self.assertEqual(pullback.version, "4.10.0")
         self.assertEqual(copy.name, "bn-stra-copy-lead-1")
-        self.assertEqual(copy.version, "2.4.0")
+        self.assertEqual(copy.version, "2.5.0")
 
     def test_pullback_model_arms_before_confirming_long(self) -> None:
         strategy = build_strategy("bn-stra-top-gainers-exhaustion-short-1", {})

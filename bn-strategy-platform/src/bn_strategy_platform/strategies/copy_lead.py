@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 import urllib.error
 import urllib.request
@@ -22,6 +23,7 @@ class CopyLeadSettings:
     portfolio_id: str
     margin_per_trade: Decimal = Decimal("50")
     page_size: int = 20
+    max_pages: int = 10
     lookback_seconds: int = 3600
     max_entry_delay_seconds: int = 120
     event_not_before_ms: int = 0
@@ -52,6 +54,7 @@ class CopyLeadSettings:
             portfolio_id=str(raw["portfolio_id"]),
             margin_per_trade=Decimal(str(raw.get("margin_per_trade", "50"))),
             page_size=int(raw.get("page_size", 20)),
+            max_pages=int(raw.get("max_pages", 10)),
             lookback_seconds=int(raw.get("lookback_seconds", 3600)),
             max_entry_delay_seconds=int(raw.get("max_entry_delay_seconds", 120)),
             event_not_before_ms=int(raw.get("event_not_before_ms", 0)),
@@ -76,7 +79,8 @@ class CopyLeadSettings:
         )
         if settings.margin_per_trade <= 0 or settings.min_lead_notional < 0:
             raise ValueError("copy-lead sizing values must be valid")
-        if (settings.page_size < 1 or settings.lookback_seconds < 1
+        if (settings.page_size < 1 or not 1 <= settings.max_pages <= 20
+                or settings.lookback_seconds < 1
                 or settings.max_entry_delay_seconds < 1):
             raise ValueError("copy-lead polling values must be positive")
         if settings.event_not_before_ms < 0:
@@ -93,18 +97,38 @@ class CopyLeadSettings:
 
 class CopyLeadStrategy:
     name = "copy-lead"
-    version = "2.4.0"
+    version = "2.5.0"
     interval = "5m"
     candle_limit = 120
 
-    def __init__(self, settings: CopyLeadSettings, store: TradeStorePort | None = None) -> None:
+    def __init__(self, settings: CopyLeadSettings, store: TradeStorePort | None = None,
+                 mode: str = "paper") -> None:
         self.settings = settings
         self.store = store
+        self.mode = mode
+        self._received_at: dict[str, int] = {}
 
     def poll_events(self, market: MarketDataPort) -> Sequence[StrategyEvent]:
         now_ms = int(time.time() * 1000)
-        events = [self._event(row, market) for row in self._fetch(now_ms - self.settings.lookback_seconds * 1000, now_ms)]
+        events = []
+        for row in self._fetch(now_ms - self.settings.lookback_seconds * 1000, now_ms):
+            try:
+                event = self._event(row, market)
+                if event is not None:
+                    events.append(event)
+            except Exception:
+                logging.exception("lead order processing failed strategy=%s symbol=%s",
+                                  self.name, row.get("symbol"))
         return sorted((item for item in events if item is not None), key=lambda item: item.observed_at_ms)
+
+    def record_event_decision(self, event: StrategyEvent, decision: str, reason: str = "",
+                              metrics: Mapping[str, Any] | None = None) -> None:
+        if self.store is not None:
+            self.store.decide_lead_order(
+                self.name, self.mode, self.settings.portfolio_id, event.event_id,
+                decision, reason, metrics if metrics is not None
+                else (event.signal.metrics if event.signal else None),
+            )
 
     def manage(self, position: Position, candles: Sequence[Candle], mark: Decimal) -> Iterable[PositionAction]:
         stopped = mark <= position.stop_price if position.side is Side.LONG else mark >= position.stop_price
@@ -156,9 +180,13 @@ class CopyLeadStrategy:
         return [PositionAction("move_stop", reason, stop_price=candidate)]
 
     def event_entry_block_reason(self, event: StrategyEvent, mode: str) -> str | None:
-        if event.kind != "open" or event.signal is None or self.store is None:
+        if event.kind != "open" or event.signal is None:
             return None
         now_ms = int(time.time() * 1000)
+        if now_ms - event.observed_at_ms > self.settings.max_entry_delay_seconds * 1000:
+            return "entry delay exceeded before execution"
+        if self.store is None:
+            return None
         start_ms, end_ms = self._day_bounds(now_ms)
         stops = self.store.count_stop_losses(
             self.name, mode, event.symbol, event.side, start_ms, end_ms,
@@ -175,42 +203,85 @@ class CopyLeadStrategy:
         return None
 
     def _event(self, row: Mapping[str, Any], market: MarketDataPort) -> StrategyEvent | None:
-        symbol = str(row["symbol"]).upper()
-        position_side, order_side = str(row["positionSide"]).upper(), str(row["side"]).upper()
+        symbol = str(row.get("symbol", "")).upper()
+        position_side = str(row.get("positionSide", "")).upper()
+        order_side = str(row.get("side", "")).upper()
         side = Side.LONG if position_side == "LONG" else Side.SHORT
         actions = {("LONG", "BUY"): "open", ("LONG", "SELL"): "close",
                    ("SHORT", "SELL"): "open", ("SHORT", "BUY"): "close"}
         kind = actions.get((position_side, order_side))
-        if kind is None or symbol in self.settings.blocked_symbols:
-            return None
-        if self.settings.allowed_symbols and symbol not in self.settings.allowed_symbols:
-            return None
-        observed = int(row.get("orderUpdateTime", row["orderTime"]))
-        if observed < self.settings.event_not_before_ms:
-            return None
-        age = max(0, int(time.time() * 1000) - observed)
-        if kind == "open" and age > self.settings.max_entry_delay_seconds * 1000:
-            return None
-        executed, average = Decimal(str(row["executedQty"])), Decimal(str(row["avgPrice"]))
-        if kind == "open" and executed * average < self.settings.min_lead_notional:
-            return None
-        raw_id = "|".join((symbol, order_side, position_side, str(executed), str(average),
-                           str(row["orderTime"]), str(observed)))
+        try:
+            observed = int(row.get("orderUpdateTime") or row.get("orderTime") or 0)
+        except (ValueError, TypeError):
+            observed = 0
+        now_ms = int(time.time() * 1000)
+        seen_at = self._received_at.get(json.dumps(dict(row), sort_keys=True, default=str), now_ms)
+        age = max(0, now_ms - observed)
+        # Preserve the existing identity for valid orders to prevent replay on upgrade.
+        try:
+            executed = Decimal(str(row.get("executedQty", 0)))
+            average = Decimal(str(row.get("avgPrice", 0)))
+            valid_values = executed.is_finite() and average.is_finite()
+            raw_id = "|".join((symbol, order_side, position_side, str(executed), str(average),
+                               str(row.get("orderTime", 0)), str(observed)))
+        except (ValueError, ArithmeticError):
+            executed, average, valid_values = Decimal("0"), Decimal("0"), False
+            raw_id = json.dumps(dict(row), sort_keys=True, default=str)
         event_id = hashlib.sha256(raw_id.encode()).hexdigest()
+        event = StrategyEvent(event_id, self.name, kind or "unknown", symbol, side, observed)
+        processed = bool(self.store and self.store.event_seen(event_id, self.name, self.mode))
+        if self.store is not None:
+            self.store.observe_lead_order(
+                self.name, self.version, self.mode, self.settings.portfolio_id,
+                event, row, seen_at, processed,
+            )
+        if processed:
+            return None
+        metrics: dict[str, Any] = {"order_age_ms": age}
+
+        def skip(reason: str) -> StrategyEvent:
+            self.record_event_decision(event, "skipped", reason, metrics)
+            return StrategyEvent(event_id, self.name, "skip_" + reason, symbol, side, observed)
+
+        if (not symbol or kind is None or observed <= 0 or observed > seen_at
+                or not valid_values or executed <= 0 or average <= 0):
+            return skip("invalid_order")
+        if symbol in self.settings.blocked_symbols:
+            return skip("blocked_symbol")
+        if self.settings.allowed_symbols and symbol not in self.settings.allowed_symbols:
+            return skip("not_allowed")
+        if observed < self.settings.event_not_before_ms:
+            return skip("before_cutover")
+        if kind == "open" and age > self.settings.max_entry_delay_seconds * 1000:
+            return skip("stale")
+        metrics.update(lead_price=str(average), lead_notional=str(executed * average))
+        if kind == "open" and executed * average < self.settings.min_lead_notional:
+            return skip("notional")
         signal = None
         if kind == "open":
-            mark = market.mark_price(symbol)
-            deviation = abs(mark / average - Decimal("1")) if average > 0 else Decimal("999")
+            try:
+                mark = market.mark_price(symbol)
+            except Exception:
+                self.record_event_decision(event, "error", "market_data_error", metrics)
+                raise
+            deviation = abs(mark / average - Decimal("1"))
+            metrics.update(mark_price=str(mark), lead_price_deviation=str(deviation))
             if deviation > self.settings.max_lead_price_deviation:
-                return StrategyEvent(
-                    event_id, self.name, "skip_price_deviation", symbol, side, observed,
-                )
-            stop = self._stop(mark, side, market.candles(symbol, self.interval, self.candle_limit))
+                return skip("price_deviation")
+            if int(time.time() * 1000) - observed > self.settings.max_entry_delay_seconds * 1000:
+                return skip("stale")
+            try:
+                candles = market.candles(symbol, self.interval, self.candle_limit)
+            except Exception:
+                self.record_event_decision(event, "error", "market_data_error", metrics)
+                raise
+            stop = self._stop(mark, side, candles)
+            if int(time.time() * 1000) - observed > self.settings.max_entry_delay_seconds * 1000:
+                return skip("stale")
             score = max(Decimal("0"), Decimal("100") - Decimal(age) / Decimal("60000") * Decimal("5"))
             signal = Signal(self.name, self.version, symbol, side, mark, stop, score, "lead_open", observed,
-                            {"lead_price": str(average), "lead_notional": str(executed * average),
-                             "lead_price_deviation": str(deviation),
-                             "order_age_ms": age}, self.settings.margin_per_trade)
+                            metrics, self.settings.margin_per_trade)
+        self.record_event_decision(event, "eligible", "", metrics)
         return StrategyEvent(event_id, self.name, kind, symbol, side, observed, signal)
 
     def _stop(self, entry: Decimal, side: Side, candles: Sequence[Candle]) -> Decimal:
@@ -244,18 +315,78 @@ class CopyLeadStrategy:
         return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
     def _fetch(self, start_ms: int, end_ms: int) -> list[Mapping[str, Any]]:
-        body = json.dumps({"portfolioId": self.settings.portfolio_id, "pageNumber": 1,
+        deadline = time.monotonic() + 15
+        self._received_at.clear()
+        result: list[Mapping[str, Any]] = []
+        page_signatures: set[str] = set()
+        for page in range(1, self.settings.max_pages + 1):
+            try:
+                payload = self._fetch_page(start_ms, end_ms, page, deadline)
+                data = payload.get("data") or {}
+                rows = data.get("list")
+                if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                    raise RuntimeError("Binance lead API returned invalid order list")
+                if not rows:
+                    break
+                signature = json.dumps(rows, sort_keys=True, default=str)
+                if signature in page_signatures:
+                    raise RuntimeError("Binance lead API repeated a page")
+                page_signatures.add(signature)
+                received_at = int(time.time() * 1000)
+                for row in rows:
+                    self._received_at.setdefault(
+                        json.dumps(row, sort_keys=True, default=str), received_at,
+                    )
+                result.extend(rows)
+                total = data.get("total")
+                if total is not None:
+                    if len(result) >= int(total):
+                        break
+                elif len(rows) < self.settings.page_size:
+                    break
+                if page == self.settings.max_pages:
+                    logging.warning("lead fetch truncated strategy=%s pages=%s rows=%s total=%s",
+                                    self.name, page, len(result), total)
+            except Exception:
+                if not result:
+                    raise
+                logging.exception("lead fetch incomplete strategy=%s page=%s retained_rows=%s",
+                                  self.name, page, len(result))
+                break
+        logging.info("lead fetch strategy=%s pages=%s rows=%s window_seconds=%s",
+                     self.name, page, len(result), (end_ms - start_ms) // 1000)
+        return result
+
+    def _fetch_page(self, start_ms: int, end_ms: int, page: int,
+                    deadline: float) -> Mapping[str, Any]:
+        body = json.dumps({"portfolioId": self.settings.portfolio_id, "pageNumber": page,
                            "pageSize": self.settings.page_size, "startTime": start_ms,
                            "endTime": end_ms}, separators=(",", ":")).encode()
         request = urllib.request.Request(
             f"{self.settings.web_base_url.rstrip('/')}/bapi/futures/v1/friendly/future/copy-trade/lead-portfolio/order-history",
             data=body, method="POST", headers={"User-Agent": "bn-strategy-platform/1.0",
                                                 "Content-Type": "application/json", "clienttype": "web", "lang": "en"})
-        try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                payload = json.loads(response.read().decode())
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"Binance lead API error {exc.code}: {exc.read().decode(errors='replace')}") from exc
-        if payload.get("code") != "000000" or not payload.get("success", False):
-            raise RuntimeError(f"Binance lead API rejected request: {payload}")
-        return list(payload.get("data", {}).get("list", []))
+        for attempt in range(2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Binance lead API fetch budget exhausted")
+            try:
+                with urllib.request.urlopen(request, timeout=min(5, remaining)) as response:
+                    payload = json.loads(response.read().decode())
+            except urllib.error.HTTPError as exc:
+                if attempt == 0 and (exc.code == 429 or exc.code >= 500):
+                    time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+                    continue
+                raise RuntimeError(f"Binance lead API HTTP error {exc.code}") from exc
+            except (urllib.error.URLError, TimeoutError):
+                if attempt == 0:
+                    time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+                    continue
+                raise
+            if payload.get("code") == "000000" and payload.get("success", False):
+                return payload
+            if attempt == 0 and payload.get("code") == "11012005":
+                time.sleep(min(0.5, max(0, deadline - time.monotonic())))
+                continue
+            raise RuntimeError(f"Binance lead API rejected request: {payload.get('code')}")
+        raise RuntimeError("Binance lead API retry budget exhausted")

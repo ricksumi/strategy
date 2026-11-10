@@ -187,6 +187,44 @@ def config(mode=RunMode.PAPER):
 
 
 class EngineTests(unittest.TestCase):
+    def test_event_poll_failure_does_not_abort_other_strategy_entries(self) -> None:
+        class FailingEvents(EventStrategy):
+            name = "failing-events"
+
+            def poll_events(self, market):
+                raise RuntimeError("lead API busy")
+
+        runtime_config = replace(config(), strategies=(
+            StrategyConfig("test-strategy", True, {}),
+            StrategyConfig("failing-events", True, {}),
+        ))
+        store = MemoryTradeStore()
+        engine = TradingEngine(
+            runtime_config, Market(), Exchange(), store, Notifier(), [Strategy()],
+            [FailingEvents()],
+        )
+        with self.assertLogs(level="ERROR") as logs:
+            engine.run_once()
+        self.assertEqual(len(engine.paper_positions), 1)
+        self.assertTrue(any("failing-events" in message for message in logs.output))
+
+    def test_event_allocation_rejection_is_reported_to_audit_hook(self) -> None:
+        class AuditedEvents(EventStrategy):
+            def __init__(self):
+                self.decisions = []
+
+            def record_event_decision(self, event, decision, reason):
+                self.decisions.append((decision, reason))
+
+        events = AuditedEvents()
+        engine = TradingEngine(
+            config(), Market(), Exchange(), MemoryTradeStore(), Notifier(), [], [events],
+        )
+        with patch.object(engine.paper_execution, "open", side_effect=ValueError("maximum concurrent positions reached")):
+            with self.assertLogs(level="ERROR"):
+                engine.run_once()
+        self.assertEqual(events.decisions, [("blocked", "maximum concurrent positions reached")])
+
     def test_paper_switch_keeps_existing_live_position_managed(self) -> None:
         runtime_config = replace(
             config(RunMode.LIVE),

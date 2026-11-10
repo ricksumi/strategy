@@ -105,7 +105,7 @@ SCHEMA = (
       strategy_version VARCHAR(32) NOT NULL,
       run_mode VARCHAR(16) NOT NULL,
       event_id VARCHAR(96) NOT NULL,
-      event_kind VARCHAR(16) NOT NULL,
+      event_kind VARCHAR(32) NOT NULL,
       symbol VARCHAR(32) NOT NULL,
       side VARCHAR(8) NOT NULL,
       status VARCHAR(32) NOT NULL,
@@ -113,6 +113,29 @@ SCHEMA = (
       created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
       PRIMARY KEY (strategy_name, run_mode, event_id),
       KEY idx_external_event_time (observed_at_ms)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS strategy_lead_orders (
+      strategy_name VARCHAR(96) NOT NULL,
+      strategy_version VARCHAR(32) NOT NULL,
+      run_mode VARCHAR(16) NOT NULL,
+      portfolio_id VARCHAR(64) NOT NULL,
+      event_id VARCHAR(96) NOT NULL,
+      symbol VARCHAR(32) NOT NULL,
+      side VARCHAR(8) NOT NULL,
+      event_kind VARCHAR(64) NOT NULL,
+      order_time_ms BIGINT NOT NULL,
+      observed_at_ms BIGINT NOT NULL,
+      first_seen_at_ms BIGINT NOT NULL,
+      last_seen_at_ms BIGINT NOT NULL,
+      first_seen_delay_ms BIGINT NOT NULL,
+      raw_order_json JSON NOT NULL,
+      decision VARCHAR(32) NOT NULL,
+      decision_reason VARCHAR(255) NOT NULL DEFAULT '',
+      metrics_json JSON NOT NULL,
+      decision_at_ms BIGINT NULL,
+      PRIMARY KEY (strategy_name, run_mode, portfolio_id, event_id),
+      KEY idx_lead_first_seen (strategy_name, first_seen_at_ms),
+      KEY idx_lead_decision (strategy_name, decision, first_seen_at_ms)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
 )
 
@@ -123,6 +146,13 @@ class MySqlTradeStore:
         with self._cursor() as cursor:
             for statement in SCHEMA:
                 cursor.execute(statement)
+            cursor.execute("""SELECT CHARACTER_MAXIMUM_LENGTH AS width
+                           FROM information_schema.COLUMNS
+                           WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='strategy_external_events'
+                             AND COLUMN_NAME='event_kind'""")
+            if int(cursor.fetchone()["width"]) < 32:
+                cursor.execute("""ALTER TABLE strategy_external_events
+                               MODIFY COLUMN event_kind VARCHAR(32) NOT NULL""")
             cursor.execute("""ALTER TABLE strategy_trades
                            ADD COLUMN IF NOT EXISTS entry_context VARCHAR(32)
                            NOT NULL DEFAULT 'normal' AFTER mode""")
@@ -410,6 +440,34 @@ class MySqlTradeStore:
           ON DUPLICATE KEY UPDATE status=VALUES(status)""",
           (event.strategy, version, mode, event.event_id, event.kind, event.symbol,
            event.side.value, status, event.observed_at_ms))
+
+    def observe_lead_order(self, strategy, version, mode, portfolio_id, event,
+                           raw_order, seen_at_ms, previously_processed=False) -> None:
+        try:
+            order_time = int(raw_order.get("orderTime") or 0)
+        except (ValueError, TypeError):
+            order_time = 0
+        self._execute("""INSERT INTO strategy_lead_orders
+          (strategy_name,strategy_version,run_mode,portfolio_id,event_id,symbol,side,
+           event_kind,order_time_ms,observed_at_ms,first_seen_at_ms,last_seen_at_ms,
+           first_seen_delay_ms,raw_order_json,decision,metrics_json)
+          VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+          ON DUPLICATE KEY UPDATE last_seen_at_ms=GREATEST(last_seen_at_ms,VALUES(last_seen_at_ms)),
+          raw_order_json=VALUES(raw_order_json)""",
+          (strategy, version, mode, portfolio_id, event.event_id, event.symbol,
+           event.side.value, event.kind, order_time,
+           event.observed_at_ms, seen_at_ms, seen_at_ms,
+           max(0, seen_at_ms - event.observed_at_ms),
+           json.dumps(dict(raw_order), ensure_ascii=False, default=str),
+           "previously_processed" if previously_processed else "observed", "{}"))
+
+    def decide_lead_order(self, strategy, mode, portfolio_id, event_id,
+                          decision, reason, metrics) -> None:
+        self._execute("""UPDATE strategy_lead_orders SET decision=%s,decision_reason=%s,
+          metrics_json=COALESCE(%s,metrics_json),decision_at_ms=%s
+          WHERE strategy_name=%s AND run_mode=%s AND portfolio_id=%s AND event_id=%s""",
+          (decision, reason[:255], json.dumps(dict(metrics), default=str) if metrics is not None else None,
+           int(time.time() * 1000), strategy, mode, portfolio_id, event_id))
 
     def _upsert_state(self, cursor: Any, position: Position, now: int) -> None:
         cursor.execute("""INSERT INTO platform_position_state
